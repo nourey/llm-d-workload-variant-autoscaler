@@ -101,6 +101,8 @@ rules:
   verbs:
   - get
   - list
+  - patch
+  - update
   - watch
 - apiGroups:
   - leaderworkerset.x-k8s.io
