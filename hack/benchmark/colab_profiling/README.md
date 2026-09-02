@@ -190,8 +190,8 @@ per run:
 | Bucket | `L_in` | `L_out` | `W` (total target tokens) | Real-hardware status |
 | --- | ---: | ---: | ---: | --- |
 | `balanced` | 256 | 256 | 512 | **VALIDATED** on real Tesla T4 hardware (see below) |
-| `input-heavy` | 384 | 128 | 512 | **NOT YET VALIDATED** |
-| `output-heavy` | 128 | 384 | 512 | **NOT YET VALIDATED** |
+| `input-heavy` | 384 | 128 | 512 | **VALIDATED** on independent real Tesla T4 hardware |
+| `output-heavy` | 128 | 384 | 512 | **NOT YET VALIDATED** (see below) |
 
 **Balanced-bucket result (already validated, do not re-derive from local
 tests):** two independent 180s confirmation runs, on independent Tesla T4
@@ -204,13 +204,23 @@ C=64: 1274.3 logical token/s   (adjacent gain ~3.7%)
 ```
 
 giving a provisional empirical monolithic capacity
-`V_M^(balanced) ≈ 1.27k logical token/s`. This conclusion was reached by
-HUMAN REVIEW of real Colab evidence, not by this repository's code.
+`V_M^(balanced) ≈ 1274 logical token/s`.
 
-`input-heavy` and `output-heavy` are runnable through the exact same,
-already-validated measurement methodology, but **no real-hardware run has
-been performed for them yet**. Do not treat any input-heavy/output-heavy
-number as validated until a real Colab run has been reviewed the same way.
+**Input-heavy result (already validated, do not re-derive from local
+tests):** validated on independent real Tesla T4 hardware runs under the
+same monolithic non-P/D serving configuration, giving a provisional
+empirical monolithic capacity `V_M^(input-heavy) ≈ 1820 logical token/s`.
+
+Both conclusions were reached by HUMAN REVIEW of real Colab evidence, not by
+this repository's code.
+
+**Output-heavy is NOT YET VALIDATED.** Real-runtime profiling exposed a
+suspected initial-admission phase-synchronization / completion-wave
+aliasing artifact — see
+["Output-heavy completion-wave risk"](#output-heavy-completion-wave-risk-estimator-quality-vs-measurement-validity)
+below before running or interpreting output-heavy results. Do not treat any
+output-heavy number as validated until this has been resolved on real
+hardware and reviewed the same way as balanced/input-heavy.
 
 Every run profiles **exactly one** bucket, using **only**
 `profiling.jsonl` records for that bucket (never `heldout.jsonl` and never
@@ -322,6 +332,27 @@ python hack/benchmark/colab_profiling/profile_bucket.py \
   --output-dir /content/wva-1546-input-heavy-profiling
 ```
 
+For `output-heavy` at higher concurrency, keep the (default, enabled)
+initial-admission ramp — see
+["Deterministic initial-admission ramp"](#deterministic-initial-admission-ramp)
+below — and inspect the `completion_clustering` block in
+`point_summaries.jsonl` before drawing any conclusion:
+
+```bash
+python hack/benchmark/colab_profiling/profile_bucket.py \
+  --profiling-jsonl /content/wva-1546-prompts/profiling.jsonl \
+  --base-url http://127.0.0.1:8000 \
+  --bucket output-heavy \
+  --model Qwen/Qwen2.5-3B \
+  --tokenizer-revision 3aab1f1954e9cc14eb9509a215f9e5ca08227a9b \
+  --gpu-memory-utilization 0.90 \
+  --concurrency 64,96,128,160,192 \
+  --settling-seconds 60 \
+  --measurement-seconds 180 \
+  --ramp-admission-interval-seconds 0.05 \
+  --output-dir /content/wva-1546-output-heavy-profiling
+```
+
 Start with a conservative concurrency subset before attempting the full
 ladder (the first real run should escalate conservatively per D7). Once a
 subset looks healthy (no invalidation reasons, no server errors, no
@@ -407,6 +438,171 @@ that specific point's own `[T0, T1)` window, so telemetry from a different
 concurrency or a different point can never leak into another point's
 summary.
 
+### Output-heavy completion-wave risk (estimator quality vs. measurement validity)
+
+Real output-heavy profiling exposed a suspicious pattern: several
+concurrency points completed near-exact multiples of the target concurrency
+`C` within one measurement window (e.g. `completed = 2*C`), with an
+apparently *non-monotonic* throughput curve across concurrency, despite
+**zero request failures, zero preemptions, GPU ~100% utilization, and
+bounded drains** — i.e. every point was individually **valid** by every
+existing check.
+
+**Why equal-length, long-output workloads can phase-synchronize.** Every
+bucket's records share one fixed `target_output_tokens` (that is the
+bucket's definition), so this risk is not unique to `output-heavy` in
+principle. What makes it acute for `output-heavy` specifically is the
+combination of (a) the closed-loop scheduler's initial admission loop,
+which historically submitted all `C` initial requests via a tight, zero-
+delay `for` loop (see "Deterministic initial-admission ramp" below), and
+(b) `output-heavy`'s long, uniform decode length (`L_out = 384`): requests
+admitted within the same narrow burst, with identical prompt/decode
+lengths, can progress through decode together and terminate close together.
+Their closed-loop replacements can then re-enter together too, preserving a
+"completion wave" structure indefinitely. A single such wave at `C=160`
+represents `160 * 512 = 81,920` logical tokens; gaining or losing exactly
+one wave inside a 180s window shifts the estimated rate by roughly `81,920
+/ 180 ≈ 455 token/s` — large enough, relative to the ~1.2–1.8k token/s
+capacities already measured for the other buckets, to plausibly explain the
+observed non-monotonic curve as a boundary-aliasing artifact rather than a
+real capacity effect.
+
+**Measurement validity is not the same thing as estimator quality.** A
+`[T0, T1)` window that only ever samples 1–2 discrete completion waves is
+still a *valid* measurement by every existing check (D15): the requests
+that did complete were server-validated, the drain was bounded, nothing
+failed. But a rate estimated from 1–2 wave-sized samples is a much noisier
+estimate of *steady-state* throughput than the same request count spread
+smoothly across the window would be. This tool distinguishes the two
+concerns explicitly: `run_valid` (and `invalidation_reasons`) answer "is
+this data trustworthy at all", while the new `completion_clustering` block
+(below) answers "how much should a human trust this point as a *smooth*
+steady-state estimate" — and only the former ever gates anything
+automatically.
+
+**Completion-burst diagnostic (fixed-width sliding window, non-chaining).**
+Every point summary includes a `completion_clustering` block, computed
+purely from that point's own `request_results.jsonl` terminal timestamps
+(reusable directly against a real artifact; no GPU required):
+
+* `completion_count` — exactly the population used for the capacity
+  numerator (`in_measurement_window and passed`); always equal to that same
+  point's `completed_requests_in_window`.
+* `inter_completion_gap_seconds` — `{available, count, min, max, avg}` over
+  consecutive sorted terminal timestamps, or `{"available": false}` if
+  fewer than two completions occurred. Diagnostic evidence only; it never
+  decides anything by itself.
+* `burst_window_seconds` / `max_completions_in_burst_window` /
+  `max_burst_fraction_of_concurrency` — the maximum number of completions
+  found in **any** fixed-width window of `burst_window_seconds` (default
+  `0.5s`, configurable via `--burst-window-seconds`), computed by an exact
+  O(n) two-pointer sliding-window scan over every possible window position,
+  and that count as a fraction of target concurrency `C`. **Boundary
+  semantics are exact and non-chaining**: for a window anchored at
+  `window_start`, a timestamp `t` is inside the window iff
+  `window_start <= t <= window_start + burst_window_seconds`. Critically,
+  membership is always relative to the window's own fixed anchor, never to
+  a chain of neighbors — a timestamp can never pull in another timestamp
+  more than `burst_window_seconds` away from that anchor.
+* `phase_synchronization_suspected` — `true` iff
+  `max_burst_fraction_of_concurrency >= near_concurrency_burst_threshold_fraction`
+  (default `0.8`, configurable via
+  `--near-concurrency-burst-threshold-fraction`).
+* `repeated_burst_episodes` (secondary, simpler evidence) —
+  `{episode_count, episode_sizes, near_concurrency_episode_count}`: sorted
+  timestamps are greedily partitioned into **non-overlapping**
+  `burst_window_seconds`-wide episodes (each anchored at the next
+  unassigned timestamp), giving a human a quick read on whether *multiple,
+  separated* near-`C` bursts occurred (matching the real repeated
+  `completed = k*C` observation) without reintroducing chaining.
+
+**Corrected from an earlier defect: do not use single-linkage/chained
+clustering here.** This diagnostic originally grouped timestamps by
+nearest-neighbor-chain ("single-linkage") clustering: a timestamp joined a
+cluster iff it was within a tolerance of the immediately *previous*
+timestamp already in that cluster. That chains transitively — a perfectly
+healthy, continuous, high-throughput completion stream with small adjacent
+gaps (e.g. a steady ~3–4 req/s output-heavy stream, inter-completion gaps
+~0.25–0.33s, all comfortably under a 0.5s tolerance) would be merged into
+**one arbitrarily large "cluster" spanning the entire measurement window**,
+producing a **false-positive** `phase_synchronization_suspected` verdict on
+exactly the real regime this diagnostic exists to check. The fixed-width
+sliding-window algorithm above cannot do this: a continuous stream with
+gaps smaller than the window still only ever contributes a small, bounded
+count to any one window (e.g. ~2–3 completions per 0.5s window at a
+0.25–0.33s cadence), never the whole stream.
+
+The now-removed fields `cluster_tolerance_seconds`, `cluster_count`,
+`cluster_sizes`, `largest_cluster_size`,
+`largest_cluster_fraction_of_concurrency`, and
+`near_concurrency_cluster_count` (and the corresponding
+`--cluster-tolerance-seconds` /
+`--near-concurrency-cluster-threshold-fraction` flags) had misleading
+semantics under the corrected algorithm and have been renamed rather than
+kept for compatibility; no real-hardware artifact depended on the old
+names, since output-heavy has not yet been validated.
+
+**This diagnostic is evidence for HUMAN REVIEW only.** It is computed and
+recorded for every point (including a trivial all-zero record for a
+precondition-skipped point), but it **never** changes `run_valid`, and this
+tool never uses it to automatically accept, reject, or select a plateau.
+
+### Deterministic initial-admission ramp
+
+The closed-loop scheduler's initial fill — the very first `C` admissions of
+a load point, before settling begins — historically submitted all `C`
+requests via a tight, zero-delay `for` loop. This is architecture-level
+evidence supporting the phase-synchronization hypothesis above, independent
+of the diagnostic: submitting `C` requests within a sub-millisecond window
+is exactly the condition under which equal-length requests can decode in
+lockstep.
+
+`TimingConfig.ramp_admission_interval_seconds`
+(`--ramp-admission-interval-seconds`, default `0.05s`) paces those specific
+`C` initial admissions one at a time, this many seconds apart, instead of
+submitting them in one burst:
+
+* **Only the initial `C` admissions are paced.** Every later replacement
+  admission — issued the instant a request completes, during settling,
+  measurement, or drain — remains completely immediate, exactly as before.
+  There is no think-time inserted anywhere during measurement (D7
+  requirement 5).
+* **Settling begins only once the full target concurrency has actually been
+  reached.** `t_start` (settling start) is captured *after* the ramp
+  finishes admitting all `C` requests, not before. `T0`/`T1` are derived
+  from `t_start` exactly as before (`T0 = t_start + settling_seconds`,
+  `T1 = T0 + measurement_seconds`), so ramp time is never counted as
+  settling or measurement time and the measurement denominator
+  (`measurement_seconds`) is completely unaffected.
+* **Concurrency is never exceeded.** The ramp does not change target
+  concurrency, `[T0, T1)` semantics, the request contract, or bucket
+  records; it only changes the wall-clock pacing of the first `C`
+  admissions.
+* **`0` reproduces the original immediate-burst admission exactly** — for
+  exact A/B comparison against pre-ramp artifacts, or if an operator wants
+  to deliberately reproduce the burst to confirm the diagnostic detects it.
+* **Deterministic and non-adaptive.** The interval is a fixed, explicit,
+  operator-configured constant. It is never derived from observed model
+  latency or any other feedback signal, so the experimental procedure stays
+  reproducible.
+* **Chosen to stay small relative to settling/measurement.** For the
+  default concurrency ladder (max `C=32`), the default `0.05s` interval
+  adds at most `(32-1)*0.05 ≈ 1.6s` before settling — negligible next to the
+  default 30s settling window. For a `C=192` output-heavy point, it adds
+  `(192-1)*0.05 ≈ 9.6s` — still well under the default 30s settling and
+  60–180s measurement windows, so the ramp itself should not materially
+  change the server's steady-state operating condition.
+
+Every point summary's `startup_ramp` block records
+`ramp_admission_interval_seconds`, `ramp_enabled`, `ramp_start_s`,
+`target_concurrency_reached_s`, and `ramp_duration_s` for auditability;
+completions that finish before `target_concurrency_reached_s` are labeled
+with `phase: "ramp"` in `request_results.jsonl`. The experiment manifest
+records the configured policy under `startup_ramp` (and the clustering
+diagnostic's configuration under `completion_clustering_diagnostic`) so a
+different ramp/diagnostic configuration is always visible in the artifact,
+never silently reinterpreted.
+
 ### Known limitations / risks not yet resolved by local tests
 
 * **Resolved defect (fail-closed preconditions):** a real fresh-runtime
@@ -449,8 +645,32 @@ summary.
   cannot independently inspect the running server's actual launch flags
   beyond `/v1/models` identity and a best-effort `/version` probe, and it
   never modifies the running server.
-* `input-heavy` and `output-heavy` have only been exercised with mocked HTTP
-  transports; no real GPU run has been performed for either bucket.
+* **Resolved defect (non-chaining completion-burst diagnostic):** the
+  completion-clustering diagnostic originally used single-linkage/chained
+  clustering, which could merge a perfectly healthy, continuous completion
+  stream (small adjacent gaps, e.g. the real ~3–4 req/s output-heavy
+  regime) into one arbitrarily large false-positive "cluster" spanning the
+  whole window — see "Output-heavy completion-wave risk" above. This is
+  fixed: the diagnostic now uses a non-chaining, fixed-width sliding-window
+  computation (`max_completions_in_fixed_window`) where membership is
+  always bounded by distance to a fixed window anchor, never by transitive
+  adjacency. This is a diagnostic-only change: it does not affect the
+  startup ramp, `[T0, T1)` semantics, capacity arithmetic, or `run_valid`.
+* `output-heavy` has a suspected phase-synchronization/completion-burst
+  artifact that has NOT been re-profiled on real hardware with the ramp
+  enabled; see "Output-heavy completion-wave risk" above. `balanced` and
+  `input-heavy` are both validated; `output-heavy` is not.
+* The `0.05s` default ramp interval, and the `0.5s` default burst window /
+  `0.8` default near-concurrency threshold, are reasoned defaults
+  (documented above), not values confirmed against real output-heavy
+  hardware evidence yet — re-profiling output-heavy with ramping enabled
+  has not been performed as part of this change.
+* The completion-burst diagnostic characterizes *client-observed*
+  completion timing only; it does not independently confirm *why* requests
+  clustered (e.g. it cannot distinguish "vLLM's continuous batching genuinely
+  advances equal-length sequences in lockstep" from any other server-side
+  cause of correlated completions). It is deliberately scoped as
+  descriptive evidence, not a root-cause proof.
 * None of this has been exercised against a real network. All local tests
   use fake/mocked HTTP transports and fake GPU/telemetry samplers.
 

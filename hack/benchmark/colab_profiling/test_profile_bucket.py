@@ -557,6 +557,345 @@ class GpuTelemetrySummaryTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Completion-burst / phase-synchronization diagnostic (Phase 1, corrected)
+#
+# Pure, deterministic, no-threading tests using synthetic terminal
+# timestamps -- exactly the shape found in a real request_results.jsonl.
+#
+# The diagnostic previously used single-linkage (nearest-neighbor chain)
+# clustering, which chains transitively: a healthy continuous stream with
+# small adjacent gaps could be merged into one arbitrarily large "cluster"
+# spanning the whole window. It has been replaced with a non-chaining,
+# fixed-width sliding-window burst diagnostic. These tests specifically
+# prove the new algorithm does NOT chain (test_continuous_stream_with_...)
+# in addition to the original detection/boundary/window-leak/run_valid
+# guarantees.
+# ---------------------------------------------------------------------------
+
+
+def _passing_completion(terminal: float) -> dict[str, Any]:
+    return {
+        "passed": True,
+        "in_measurement_window": True,
+        "terminal_monotonic_s": terminal,
+        "observed_prompt_tokens": 128,
+        "observed_completion_tokens": 384,
+        "failure_reasons": [],
+    }
+
+
+class MaxCompletionsInFixedWindowTests(unittest.TestCase):
+    def test_boundary_gap_equal_to_window_is_included(self) -> None:
+        count, start = profiler.max_completions_in_fixed_window(
+            [0.0, 0.5], window_seconds=0.5
+        )
+        self.assertEqual(count, 2)
+        self.assertEqual(start, 0.0)
+
+    def test_boundary_gap_greater_than_window_is_excluded(self) -> None:
+        count, start = profiler.max_completions_in_fixed_window(
+            [0.0, 0.500001], window_seconds=0.5
+        )
+        self.assertEqual(count, 1)
+
+    def test_unsorted_input_is_sorted_first(self) -> None:
+        count, start = profiler.max_completions_in_fixed_window(
+            [5.0, 0.0, 0.2], window_seconds=0.5
+        )
+        self.assertEqual(count, 2)
+        self.assertEqual(start, 0.0)
+
+    def test_negative_window_rejected(self) -> None:
+        with self.assertRaises(profiler.ProfilingError):
+            profiler.max_completions_in_fixed_window([0.0], window_seconds=-0.1)
+
+    def test_empty_input_is_explicit(self) -> None:
+        count, start = profiler.max_completions_in_fixed_window([], window_seconds=0.5)
+        self.assertEqual(count, 0)
+        self.assertIsNone(start)
+
+    def test_does_not_chain_a_continuous_stream(self) -> None:
+        # THE CORE REGRESSION CASE: a healthy, continuous ~3.5 req/s stream
+        # (gaps 0.28-0.30s -- exactly the real output-heavy regime) spread
+        # across a much longer duration than the burst window. The OLD
+        # single-linkage algorithm would have chained the entire sequence
+        # into one giant cluster (every adjacent gap < 0.5s tolerance).
+        # The fixed-width window must report only what actually fits
+        # inside one real 0.5s window, never the whole sequence.
+        timestamps = []
+        t = 0.0
+        for i in range(200):
+            t += 0.28 if i % 2 == 0 else 0.30
+            timestamps.append(t)
+        count, _ = profiler.max_completions_in_fixed_window(
+            timestamps, window_seconds=0.5
+        )
+        # At most ceil(0.5 / 0.28) + 1 = 3 timestamps can ever fit in any
+        # real 0.5s window at this cadence; it must be far less than the
+        # 200-timestamp sequence length.
+        self.assertLessEqual(count, 3)
+        self.assertLess(count, len(timestamps))
+
+    def test_two_pointer_result_matches_brute_force(self) -> None:
+        # Cross-check the O(n) two-pointer implementation against a naive
+        # O(n^2) scan over every timestamp used as a candidate window start.
+        rng_timestamps = [
+            0.0, 0.1, 0.2, 0.35, 0.36, 1.0, 1.05, 1.4, 1.9, 2.0, 2.05, 2.5,
+        ]
+        window = 0.3
+        count, _ = profiler.max_completions_in_fixed_window(
+            rng_timestamps, window_seconds=window
+        )
+        brute_force = max(
+            sum(1 for t in rng_timestamps if start <= t <= start + window)
+            for start in rng_timestamps
+        )
+        self.assertEqual(count, brute_force)
+
+
+class PartitionIntoNonOverlappingWindowsTests(unittest.TestCase):
+    def test_two_separated_bursts_form_two_episodes(self) -> None:
+        wave_a = [i * 0.001 for i in range(5)]
+        wave_b = [10.0 + i * 0.001 for i in range(5)]
+        episodes = profiler.partition_into_non_overlapping_windows(
+            wave_a + wave_b, window_seconds=0.5
+        )
+        self.assertEqual([len(episode) for episode in episodes], [5, 5])
+
+    def test_continuous_stream_forms_many_small_episodes_not_one(self) -> None:
+        timestamps = [i * 0.28 for i in range(50)]
+        episodes = profiler.partition_into_non_overlapping_windows(
+            timestamps, window_seconds=0.5
+        )
+        self.assertGreater(len(episodes), 10)
+        self.assertTrue(all(len(episode) <= 3 for episode in episodes))
+
+    def test_negative_window_rejected(self) -> None:
+        with self.assertRaises(profiler.ProfilingError):
+            profiler.partition_into_non_overlapping_windows([0.0], window_seconds=-1)
+
+
+class CompletionClusteringDiagnosticTests(unittest.TestCase):
+    def test_one_large_synchronized_burst_is_detected(self) -> None:
+        # 64 completions all within 63ms of each other: a single burst well
+        # inside a 0.5s window.
+        results = [_passing_completion(0.0 + i * 0.001) for i in range(64)]
+        summary = profiler.summarize_completion_clustering(
+            results=results,
+            t0=0.0,
+            t1=60.0,
+            concurrency=64,
+            burst_window_seconds=0.5,
+            near_concurrency_burst_threshold_fraction=0.8,
+        )
+        self.assertEqual(summary["completion_count"], 64)
+        self.assertEqual(summary["max_completions_in_burst_window"], 64)
+        self.assertAlmostEqual(
+            summary["max_burst_fraction_of_concurrency"], 1.0
+        )
+        self.assertTrue(summary["phase_synchronization_suspected"])
+
+    def test_continuous_stream_with_small_gaps_is_not_falsely_flagged(self) -> None:
+        # THE BUG THIS TURN FIXES: real output-heavy throughput is ~3-4
+        # req/s (inter-completion gaps ~0.25-0.33s), which is smaller than
+        # the 0.5s default burst window on every adjacent pair. The OLD
+        # single-linkage diagnostic would chain this into one giant cluster
+        # covering the whole 60s window and falsely report
+        # phase_synchronization_suspected=True. It must not, now.
+        timestamps = []
+        t = 0.0
+        for i in range(180):  # ~180 completions over ~50s at this cadence
+            t += 0.28 if i % 2 == 0 else 0.30
+            timestamps.append(t)
+        results = [_passing_completion(ts) for ts in timestamps]
+        concurrency = 128  # matches the real observed output-heavy point
+        summary = profiler.summarize_completion_clustering(
+            results=results,
+            t0=0.0,
+            t1=60.0,
+            concurrency=concurrency,
+            burst_window_seconds=0.5,
+            near_concurrency_burst_threshold_fraction=0.8,
+        )
+        self.assertEqual(summary["completion_count"], len(timestamps))
+        self.assertLessEqual(summary["max_completions_in_burst_window"], 3)
+        self.assertLess(
+            summary["max_burst_fraction_of_concurrency"], 0.8
+        )
+        self.assertFalse(summary["phase_synchronization_suspected"])
+        self.assertEqual(
+            summary["repeated_burst_episodes"]["near_concurrency_episode_count"], 0
+        )
+
+    def test_multiple_separated_bursts_are_represented_correctly(self) -> None:
+        # Matches the real observation shape: e.g. C=128 completing as two
+        # back-to-back waves of ~128 within one 60s window.
+        wave_a = [_passing_completion(1.0 + i * 0.001) for i in range(32)]
+        wave_b = [_passing_completion(30.0 + i * 0.001) for i in range(32)]
+        summary = profiler.summarize_completion_clustering(
+            results=wave_a + wave_b,
+            t0=0.0,
+            t1=60.0,
+            concurrency=32,
+            burst_window_seconds=0.5,
+            near_concurrency_burst_threshold_fraction=0.8,
+        )
+        self.assertEqual(summary["completion_count"], 64)
+        self.assertEqual(summary["max_completions_in_burst_window"], 32)
+        self.assertTrue(summary["phase_synchronization_suspected"])
+        episodes = summary["repeated_burst_episodes"]
+        self.assertEqual(episodes["episode_count"], 2)
+        self.assertEqual(episodes["episode_sizes"], [32, 32])
+        self.assertEqual(episodes["near_concurrency_episode_count"], 2)
+
+    def test_samples_outside_window_do_not_leak_into_diagnostic(self) -> None:
+        in_window = [_passing_completion(10.0)]
+        before_window = [_passing_completion(-5.0)]  # marked in-window but
+        # actually outside [t0, t1): must still be excluded by the
+        # diagnostic's own explicit t0/t1 check (defense in depth).
+        after_window_flag_wrong = dict(_passing_completion(999.0))
+        not_in_window_flag = dict(_passing_completion(11.0))
+        not_in_window_flag["in_measurement_window"] = False
+        failed = dict(_passing_completion(12.0))
+        failed["passed"] = False
+
+        summary = profiler.summarize_completion_clustering(
+            results=(
+                in_window
+                + before_window
+                + [after_window_flag_wrong, not_in_window_flag, failed]
+            ),
+            t0=0.0,
+            t1=60.0,
+            concurrency=1,
+        )
+        self.assertEqual(summary["completion_count"], 1)
+
+    def test_completion_count_matches_summarize_point_numerator(self) -> None:
+        bucket = generator.DEFAULT_BUCKETS[0]
+        results = [
+            {
+                "passed": True,
+                "in_measurement_window": True,
+                "terminal_monotonic_s": 1.0 + i * 0.01,
+                "observed_prompt_tokens": bucket.input_tokens,
+                "observed_completion_tokens": bucket.target_output_tokens,
+                "failure_reasons": [],
+            }
+            for i in range(10)
+        ]
+        point_summary = profiler.summarize_point(
+            bucket=bucket,
+            concurrency=4,
+            results=results,
+            max_observed_concurrency=4,
+            t_start=0.0,
+            t0=0.0,
+            t1=60.0,
+            measurement_seconds=60.0,
+            submitted_count=10,
+            outstanding_at_t1=0,
+            outstanding_after_drain=0,
+            drain_duration=0.0,
+            drained=True,
+        )
+        clustering = profiler.summarize_completion_clustering(
+            results=results, t0=0.0, t1=60.0, concurrency=4
+        )
+        self.assertEqual(
+            clustering["completion_count"],
+            point_summary["completed_requests_in_window"],
+        )
+
+    def test_diagnostic_never_alters_run_valid(self) -> None:
+        bucket = generator.DEFAULT_BUCKETS[0]
+        # A single tightly synchronized burst: the diagnostic will strongly
+        # suspect phase synchronization, but the point itself is otherwise
+        # perfectly valid (no failures, drained, concurrency achieved).
+        results = [
+            {
+                "passed": True,
+                "in_measurement_window": True,
+                "terminal_monotonic_s": 1.0 + i * 0.0001,
+                "observed_prompt_tokens": bucket.input_tokens,
+                "observed_completion_tokens": bucket.target_output_tokens,
+                "failure_reasons": [],
+            }
+            for i in range(16)
+        ]
+        point_summary = profiler.summarize_point(
+            bucket=bucket,
+            concurrency=16,
+            results=results,
+            max_observed_concurrency=16,
+            t_start=0.0,
+            t0=0.0,
+            t1=60.0,
+            measurement_seconds=60.0,
+            submitted_count=16,
+            outstanding_at_t1=0,
+            outstanding_after_drain=0,
+            drain_duration=0.0,
+            drained=True,
+        )
+        clustering = profiler.summarize_completion_clustering(
+            results=results, t0=0.0, t1=60.0, concurrency=16
+        )
+        self.assertTrue(point_summary["run_valid"])
+        self.assertTrue(clustering["phase_synchronization_suspected"])
+        # Changing the diagnostic's own configuration must not be able to
+        # influence run_valid, because summarize_point never receives
+        # clustering output at all.
+        stricter_clustering = profiler.summarize_completion_clustering(
+            results=results,
+            t0=0.0,
+            t1=60.0,
+            concurrency=16,
+            burst_window_seconds=0.00001,
+        )
+        self.assertNotEqual(
+            clustering["max_completions_in_burst_window"],
+            stricter_clustering["max_completions_in_burst_window"],
+        )
+        self.assertTrue(point_summary["run_valid"])
+
+    def test_invalid_window_and_threshold_are_rejected(self) -> None:
+        with self.assertRaises(profiler.ProfilingError):
+            profiler.summarize_completion_clustering(
+                results=[], t0=0.0, t1=1.0, concurrency=1, burst_window_seconds=-1
+            )
+        with self.assertRaises(profiler.ProfilingError):
+            profiler.summarize_completion_clustering(
+                results=[],
+                t0=0.0,
+                t1=1.0,
+                concurrency=1,
+                near_concurrency_burst_threshold_fraction=0.0,
+            )
+        with self.assertRaises(profiler.ProfilingError):
+            profiler.summarize_completion_clustering(
+                results=[],
+                t0=0.0,
+                t1=1.0,
+                concurrency=1,
+                near_concurrency_burst_threshold_fraction=1.5,
+            )
+
+    def test_no_completions_is_explicit(self) -> None:
+        summary = profiler.summarize_completion_clustering(
+            results=[], t0=0.0, t1=60.0, concurrency=8
+        )
+        self.assertEqual(summary["completion_count"], 0)
+        self.assertEqual(summary["max_completions_in_burst_window"], 0)
+        self.assertIsNone(summary["max_burst_window_start_s"])
+        self.assertFalse(summary["phase_synchronization_suspected"])
+        self.assertEqual(
+            summary["inter_completion_gap_seconds"], {"available": False}
+        )
+        self.assertEqual(summary["repeated_burst_episodes"]["episode_count"], 0)
+
+
+# ---------------------------------------------------------------------------
 # Existing concurrency/admission/window/drain behavior (still passing)
 # ---------------------------------------------------------------------------
 
@@ -841,6 +1180,342 @@ class RunLoadPointTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Deterministic initial-admission ramp (Phase 2)
+#
+# Real output-heavy profiling exposed near-exact multiples of C completing
+# together within one measurement window. The admission loop submits its
+# initial C requests via a tight for-loop with zero delay; this class
+# proves the ramp de-synchronizes that burst while preserving every other
+# closed-loop/window/drain guarantee unchanged.
+# ---------------------------------------------------------------------------
+
+
+class StartupRampTests(unittest.TestCase):
+    def setUp(self) -> None:
+        all_records = make_records(64)
+        self.bucket = generator.DEFAULT_BUCKETS[2]  # "output-heavy"
+        self.assertEqual(self.bucket.name, "output-heavy")
+        self.records = profiler.select_bucket_records(all_records, self.bucket.name)
+        self.cycle = profiler.PromptCycle(self.records)
+        self.endpoint = "http://127.0.0.1:8000/v1/completions"
+
+    def _initial_admission_submit_timestamps(
+        self, results: list[dict[str, Any]], concurrency: int
+    ) -> list[float]:
+        # Within one run_load_point() call, the initial `concurrency`
+        # admissions are exactly the `concurrency` smallest cycle.next()
+        # sequence numbers present in that call's own results (sequences
+        # are assigned in admission order; later/higher sequences are
+        # replacements). This does not assume sequences start at 0, since a
+        # shared PromptCycle's counter is not reset between calls.
+        ordered = sorted(results, key=lambda result: result["sequence"])
+        return [result["submit_monotonic_s"] for result in ordered[:concurrency]]
+
+    def test_ramp_spaces_initial_admissions_when_enabled(self) -> None:
+        concurrency = 5
+        ramp_interval = 0.05
+        # Long delay: guarantees none of the initial admissions can
+        # complete (and trigger a replacement) before the ramp itself
+        # finishes, keeping sequence 0..concurrency-1 unambiguous.
+        transport = DelayedTransport(delay_seconds=2.0)
+        timing = profiler.TimingConfig(
+            settling_seconds=0.01,
+            measurement_seconds=0.01,
+            drain_timeout_seconds=5.0,
+            metrics_interval_seconds=1.0,
+            request_timeout_seconds=10.0,
+            ramp_admission_interval_seconds=ramp_interval,
+        )
+        summary, results = profiler.run_load_point(
+            concurrency=concurrency,
+            cycle=self.cycle,
+            endpoint=self.endpoint,
+            model=MODEL,
+            bucket=self.bucket,
+            timing=timing,
+            transport=transport,
+            idle_check=always_ok_idle_check,
+            run_id="ramp-test",
+        )
+        submit_timestamps = self._initial_admission_submit_timestamps(
+            results, concurrency
+        )
+        self.assertEqual(len(set(submit_timestamps)), concurrency)
+        gaps = [
+            second - first
+            for first, second in zip(submit_timestamps, submit_timestamps[1:])
+        ]
+        for gap in gaps:
+            self.assertGreaterEqual(gap, ramp_interval * 0.5)
+        self.assertTrue(summary["startup_ramp"]["ramp_enabled"])
+        self.assertGreaterEqual(
+            summary["startup_ramp"]["ramp_duration_s"],
+            (concurrency - 1) * ramp_interval * 0.5,
+        )
+
+    def test_ramp_never_exceeds_target_concurrency(self) -> None:
+        # Fast, fixed-delay transport: some initial admissions can complete
+        # (and trigger replacements) WHILE the ramp is still admitting
+        # later initial requests -- exactly the scenario that could allow
+        # outstanding to exceed C if the ramp were implemented incorrectly.
+        transport = DelayedTransport(delay_seconds=0.02)
+        timing = profiler.TimingConfig(
+            settling_seconds=0.05,
+            measurement_seconds=0.1,
+            drain_timeout_seconds=2.0,
+            metrics_interval_seconds=1.0,
+            request_timeout_seconds=5.0,
+            ramp_admission_interval_seconds=0.05,
+        )
+        summary, results = profiler.run_load_point(
+            concurrency=8,
+            cycle=self.cycle,
+            endpoint=self.endpoint,
+            model=MODEL,
+            bucket=self.bucket,
+            timing=timing,
+            transport=transport,
+            idle_check=always_ok_idle_check,
+            run_id="ramp-test",
+        )
+        self.assertLessEqual(transport.max_active, 8)
+        self.assertEqual(summary["max_observed_concurrency"], transport.max_active)
+        self.assertLessEqual(summary["max_observed_concurrency"], 8)
+
+    def test_full_concurrency_reached_before_settling_and_t0_after_settling(
+        self,
+    ) -> None:
+        concurrency = 4
+        settling_seconds = 0.05
+        transport = DelayedTransport(delay_seconds=2.0)
+        timing = profiler.TimingConfig(
+            settling_seconds=settling_seconds,
+            measurement_seconds=0.01,
+            drain_timeout_seconds=5.0,
+            metrics_interval_seconds=1.0,
+            request_timeout_seconds=10.0,
+            ramp_admission_interval_seconds=0.05,
+        )
+        summary, _ = profiler.run_load_point(
+            concurrency=concurrency,
+            cycle=self.cycle,
+            endpoint=self.endpoint,
+            model=MODEL,
+            bucket=self.bucket,
+            timing=timing,
+            transport=transport,
+            idle_check=always_ok_idle_check,
+            run_id="ramp-test",
+        )
+        ramp = summary["startup_ramp"]
+        # Settling begins exactly when full target concurrency was reached.
+        self.assertEqual(ramp["target_concurrency_reached_s"], summary["settling_start_s"])
+        # T0 is exactly settling_start + the complete settling interval.
+        self.assertAlmostEqual(
+            summary["measurement_t0_s"],
+            summary["settling_start_s"] + settling_seconds,
+            places=9,
+        )
+        # The ramp actually took real time (was not skipped/short-circuited).
+        self.assertGreater(ramp["ramp_duration_s"], 0)
+
+    def test_ramp_time_excluded_from_measurement_denominator(self) -> None:
+        measurement_seconds = 0.2
+        transport = DelayedTransport(delay_seconds=0.3)
+        timing = profiler.TimingConfig(
+            settling_seconds=0.05,
+            measurement_seconds=measurement_seconds,
+            drain_timeout_seconds=2.0,
+            metrics_interval_seconds=1.0,
+            request_timeout_seconds=5.0,
+            ramp_admission_interval_seconds=0.05,
+        )
+        summary, _ = profiler.run_load_point(
+            concurrency=6,
+            cycle=self.cycle,
+            endpoint=self.endpoint,
+            model=MODEL,
+            bucket=self.bucket,
+            timing=timing,
+            transport=transport,
+            idle_check=always_ok_idle_check,
+            run_id="ramp-test",
+        )
+        # A ramp lasting (6-1)*0.05=0.25s (longer than the measurement
+        # window itself) must still leave the configured denominator
+        # completely untouched.
+        self.assertEqual(summary["measurement_duration_s"], measurement_seconds)
+        self.assertAlmostEqual(
+            summary["measurement_t1_s"] - summary["measurement_t0_s"],
+            measurement_seconds,
+            places=9,
+        )
+
+    def test_no_admission_after_t1_with_ramp_enabled(self) -> None:
+        transport = DelayedTransport(delay_seconds=0.5)
+        timing = profiler.TimingConfig(
+            settling_seconds=0.02,
+            measurement_seconds=0.03,
+            drain_timeout_seconds=5.0,
+            metrics_interval_seconds=1.0,
+            request_timeout_seconds=5.0,
+            ramp_admission_interval_seconds=0.02,
+        )
+        summary, results = profiler.run_load_point(
+            concurrency=3,
+            cycle=self.cycle,
+            endpoint=self.endpoint,
+            model=MODEL,
+            bucket=self.bucket,
+            timing=timing,
+            transport=transport,
+            idle_check=always_ok_idle_check,
+            run_id="ramp-test",
+        )
+        # Only the ramp's own initial admissions were ever issued; nothing
+        # after T1 (or at all, beyond the ramp) was admitted.
+        self.assertEqual(summary["requests_submitted"], 3)
+        self.assertEqual(transport.call_count, 3)
+
+    def test_measurement_remains_closed_loop_after_ramp(self) -> None:
+        transport = DelayedTransport(delay_seconds=0.01)
+        timing = profiler.TimingConfig(
+            settling_seconds=0.05,
+            measurement_seconds=0.3,
+            drain_timeout_seconds=2.0,
+            metrics_interval_seconds=1.0,
+            request_timeout_seconds=5.0,
+            ramp_admission_interval_seconds=0.02,
+        )
+        summary, _ = profiler.run_load_point(
+            concurrency=4,
+            cycle=self.cycle,
+            endpoint=self.endpoint,
+            model=MODEL,
+            bucket=self.bucket,
+            timing=timing,
+            transport=transport,
+            idle_check=always_ok_idle_check,
+            run_id="ramp-test",
+        )
+        # Many replacement cycles must still occur during measurement, well
+        # beyond the initial `concurrency` admissions.
+        self.assertGreater(summary["completed_requests_in_window"], 4 * 3)
+        self.assertTrue(summary["token_rate_invariant"]["holds"])
+
+    def test_replacement_admissions_during_measurement_are_not_staggered(
+        self,
+    ) -> None:
+        # If replacement admissions were (incorrectly) throttled at the
+        # ramp's own interval, a 0.5s measurement window could contain at
+        # most ~0.5/0.1 = 5 completions. Correct behavior (only the initial
+        # admissions are paced) yields far more, since 4 concurrent
+        # requests complete every ~0.01s once the ramp is done.
+        transport = DelayedTransport(delay_seconds=0.01)
+        timing = profiler.TimingConfig(
+            settling_seconds=0.05,
+            measurement_seconds=0.5,
+            drain_timeout_seconds=2.0,
+            metrics_interval_seconds=1.0,
+            request_timeout_seconds=5.0,
+            ramp_admission_interval_seconds=0.1,
+        )
+        summary, _ = profiler.run_load_point(
+            concurrency=4,
+            cycle=self.cycle,
+            endpoint=self.endpoint,
+            model=MODEL,
+            bucket=self.bucket,
+            timing=timing,
+            transport=transport,
+            idle_check=always_ok_idle_check,
+            run_id="ramp-test",
+        )
+        throttled_upper_bound = timing.measurement_seconds / timing.ramp_admission_interval_seconds
+        self.assertGreater(
+            summary["completed_requests_in_window"], throttled_upper_bound * 3
+        )
+
+    def test_zero_ramp_is_backward_compatible_burst_admission(self) -> None:
+        # Compare the initial-admission spread WITH ramping disabled against
+        # the same measurement WITH ramping enabled, in the same test run.
+        # This is a relative comparison rather than an absolute wall-clock
+        # threshold, so it stays robust under CI scheduling jitter while
+        # still proving the zero-ramp burst is dramatically tighter.
+        concurrency = 4
+        ramp_interval = 0.2
+
+        def spread_for(interval: float) -> tuple[dict[str, Any], float]:
+            transport = DelayedTransport(delay_seconds=1.5)
+            timing = profiler.TimingConfig(
+                settling_seconds=0.02,
+                measurement_seconds=0.01,
+                drain_timeout_seconds=3.0,
+                metrics_interval_seconds=1.0,
+                request_timeout_seconds=10.0,
+                ramp_admission_interval_seconds=interval,
+            )
+            summary, results = profiler.run_load_point(
+                concurrency=concurrency,
+                cycle=self.cycle,
+                endpoint=self.endpoint,
+                model=MODEL,
+                bucket=self.bucket,
+                timing=timing,
+                transport=transport,
+                idle_check=always_ok_idle_check,
+                run_id="ramp-test",
+            )
+            submit_timestamps = self._initial_admission_submit_timestamps(
+                results, concurrency
+            )
+            return summary, max(submit_timestamps) - min(submit_timestamps)
+
+        burst_summary, burst_spread = spread_for(0.0)
+        ramped_summary, ramped_spread = spread_for(ramp_interval)
+
+        self.assertFalse(burst_summary["startup_ramp"]["ramp_enabled"])
+        self.assertAlmostEqual(
+            burst_summary["startup_ramp"]["ramp_duration_s"], 0.0, places=2
+        )
+        self.assertTrue(ramped_summary["startup_ramp"]["ramp_enabled"])
+        self.assertGreaterEqual(
+            ramped_summary["startup_ramp"]["ramp_duration_s"],
+            (concurrency - 1) * ramp_interval * 0.5,
+        )
+        # The burst spread must be a small fraction of the ramped spread,
+        # regardless of the absolute jitter either happens to have under
+        # current system load.
+        self.assertLess(burst_spread, ramped_spread / 4)
+
+    def test_ramp_phase_label_is_used_for_early_completions(self) -> None:
+        # With a long ramp and a fast transport, the earliest-admitted
+        # requests can complete before the ramp itself finishes.
+        transport = DelayedTransport(delay_seconds=0.01)
+        timing = profiler.TimingConfig(
+            settling_seconds=0.01,
+            measurement_seconds=0.01,
+            drain_timeout_seconds=2.0,
+            metrics_interval_seconds=1.0,
+            request_timeout_seconds=5.0,
+            ramp_admission_interval_seconds=0.2,
+        )
+        summary, results = profiler.run_load_point(
+            concurrency=4,
+            cycle=self.cycle,
+            endpoint=self.endpoint,
+            model=MODEL,
+            bucket=self.bucket,
+            timing=timing,
+            transport=transport,
+            idle_check=always_ok_idle_check,
+            run_id="ramp-test",
+        )
+        self.assertIn("ramp", {result["phase"] for result in results})
+        self.assertTrue(all(not r["in_measurement_window"] for r in results if r["phase"] == "ramp"))
+
+
+# ---------------------------------------------------------------------------
 # Fail-closed precondition behavior (real Colab defect regression coverage)
 #
 # A fresh-runtime input-heavy repeatability run once started a C=48 point
@@ -994,6 +1669,23 @@ class FailedPreconditionFailsClosedTests(unittest.TestCase):
         self.assertGreater(transport.call_count, 0)
         self.assertGreater(summary["requests_submitted"], 0)
 
+    def test_failed_precondition_does_not_enter_the_startup_ramp(self) -> None:
+        # self.timing uses the default (nonzero) ramp_admission_interval_seconds;
+        # if the ramp loop were incorrectly entered before/despite the
+        # precondition check, we would observe nonzero admissions/transport
+        # calls and a nonzero ramp duration below.
+        self.assertGreater(self.timing.ramp_admission_interval_seconds, 0)
+        transport = DelayedTransport(delay_seconds=0.0)
+        summary, results = self._run(concurrency=8, transport=transport)
+        self.assertEqual(transport.call_count, 0)
+        self.assertEqual(len(results), 0)
+        self.assertEqual(summary["requests_submitted"], 0)
+        self.assertEqual(summary["startup_ramp"]["ramp_duration_s"], 0)
+        self.assertEqual(
+            summary["startup_ramp"]["ramp_start_s"],
+            summary["startup_ramp"]["target_concurrency_reached_s"],
+        )
+
 
 # ---------------------------------------------------------------------------
 # Manifest reproducibility fields
@@ -1058,16 +1750,32 @@ class ManifestTests(unittest.TestCase):
         self.assertIn("Declared by the operator", note)
 
     def test_manifest_records_selected_bucket_and_validation_status(self) -> None:
-        config = self._build_config(bucket="input-heavy", run_id="r1")
+        # output-heavy remains the not-yet-validated bucket (the suspected
+        # phase-synchronization artifact is unresolved on real hardware);
+        # balanced and input-heavy are both now validated.
+        config = self._build_config(bucket="output-heavy", run_id="r1")
         manifest = profiler.build_manifest(
             config,
-            profiler.BUCKETS_BY_NAME["input-heavy"],
+            profiler.BUCKETS_BY_NAME["output-heavy"],
             dataset_sha256="sha256:deadbeef",
             bucket_record_count=64,
             server_identity={"vllm_version": None, "gpu_fingerprint": {"available": False}},
         )
-        self.assertEqual(manifest["dataset"]["bucket_definition"]["name"], "input-heavy")
+        self.assertEqual(manifest["dataset"]["bucket_definition"]["name"], "output-heavy")
         self.assertIn("NOT YET VALIDATED", manifest["bucket_validation_status"])
+
+    def test_input_heavy_and_balanced_are_validated(self) -> None:
+        self.assertIn("VALIDATED", profiler.BUCKET_VALIDATION_STATUS["balanced"])
+        self.assertNotIn(
+            "NOT YET VALIDATED", profiler.BUCKET_VALIDATION_STATUS["balanced"]
+        )
+        self.assertIn("VALIDATED", profiler.BUCKET_VALIDATION_STATUS["input-heavy"])
+        self.assertNotIn(
+            "NOT YET VALIDATED", profiler.BUCKET_VALIDATION_STATUS["input-heavy"]
+        )
+        self.assertIn(
+            "NOT YET VALIDATED", profiler.BUCKET_VALIDATION_STATUS["output-heavy"]
+        )
 
     def test_config_validation_rejects_bad_gpu_memory_utilization(self) -> None:
         config = self._build_config(gpu_memory_utilization=1.5)

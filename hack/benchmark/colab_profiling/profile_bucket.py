@@ -21,10 +21,20 @@ accounting, and the same raw-token ``/v1/completions`` request contract.
 As of this implementation:
 
 * the ``balanced`` bucket has been VALIDATED on real Tesla T4 hardware
-  (two independent 180s confirmation runs; see the #1546 evidence record);
-* the ``input-heavy`` and ``output-heavy`` buckets are NOT YET VALIDATED —
-  this module makes them runnable, but no real-hardware evidence exists for
-  them yet.
+  (two independent 180s confirmation runs; see the #1546 evidence record):
+  ``V_M^(balanced) ~= 1274 logical token/s``;
+* the ``input-heavy`` bucket has also been VALIDATED on independent real
+  Tesla T4 runs: ``V_M^(input-heavy) ~= 1820 logical token/s``;
+* the ``output-heavy`` bucket is NOT YET VALIDATED. Real-runtime profiling
+  exposed a suspected initial-admission phase-synchronization /
+  completion-wave-aliasing artifact (near-exact multiples of the target
+  concurrency completing together, producing an apparently non-monotonic
+  throughput curve at several concurrency points despite zero failures,
+  zero preemptions, and bounded drains). See the completion-clustering
+  diagnostic (``summarize_completion_clustering``) and the deterministic
+  startup-ramp mechanism (``TimingConfig.ramp_admission_interval_seconds``)
+  added to investigate and mitigate this before drawing any output-heavy
+  capacity conclusion.
 
 It intentionally reuses the already-accepted dataset and request-contract
 layers instead of duplicating them:
@@ -94,6 +104,28 @@ DEFAULT_DRAIN_TIMEOUT_SECONDS = 120.0
 DEFAULT_METRICS_INTERVAL_SECONDS = 1.0
 DEFAULT_REQUEST_TIMEOUT_SECONDS = smoke.DEFAULT_TIMEOUT_SECONDS
 DEFAULT_GPU_MEMORY_UTILIZATION = 0.90
+
+# Deterministic initial-admission ramp (see TimingConfig.
+# ramp_admission_interval_seconds and run_load_point). 0.05s keeps the ramp
+# for the default concurrency ladder (max C=32) under ~1.6s, while spreading
+# a C=192 initial fill over ~9.6s -- large enough to decorrelate equal-
+# length-output completion waves, small relative to settling/measurement,
+# and never adaptively derived from observed latency.
+DEFAULT_RAMP_ADMISSION_INTERVAL_SECONDS = 0.05
+
+# Completion-burst / phase-synchronization diagnostic defaults (D16-style
+# evidence for human review; never auto-invalidates a point). 0.5s is far
+# smaller than any plausible single balanced/input-heavy/output-heavy
+# request latency, so a burst window this wide captures genuinely
+# near-simultaneous completions (e.g. from a shared vLLM decode step)
+# without conflating them with normal request-to-request latency variance
+# -- e.g. a healthy ~3-4 req/s continuous stream (inter-completion gaps
+# ~0.25-0.33s) contains only ~2 completions in any real 0.5s window, not
+# the whole stream (see max_completions_in_fixed_window: this is a
+# non-chaining fixed-width sliding window, NOT single-linkage clustering).
+DEFAULT_BURST_WINDOW_SECONDS = 0.5
+DEFAULT_NEAR_CONCURRENCY_BURST_THRESHOLD_FRACTION = 0.8
+
 MAX_RESPONSE_BYTES = smoke.MAX_RESPONSE_BYTES
 
 # The approved bucket geometry is owned by generate_dataset.py; this module
@@ -109,10 +141,26 @@ BUCKET_VALIDATION_STATUS: dict[str, str] = {
     "balanced": (
         "VALIDATED on real Tesla T4 hardware: two independent 180s "
         "confirmation runs reproduced C=48 -> ~1228.8 tok/s and "
-        "C=64 -> ~1274.3 tok/s (adjacent gain ~3.7%)."
+        "C=64 -> ~1274.3 tok/s (adjacent gain ~3.7%). "
+        "V_M^(balanced) ~= 1274 logical token/s."
     ),
-    "input-heavy": "NOT YET VALIDATED on real hardware.",
-    "output-heavy": "NOT YET VALIDATED on real hardware.",
+    "input-heavy": (
+        "VALIDATED on independent real Tesla T4 hardware runs under the "
+        "same monolithic non-P/D serving configuration. "
+        "V_M^(input-heavy) ~= 1820 logical token/s."
+    ),
+    "output-heavy": (
+        "NOT YET VALIDATED. Real-runtime profiling exposed a suspected "
+        "initial-admission phase-synchronization / completion-wave "
+        "aliasing artifact: several concurrency points completed near-"
+        "exact multiples of the target concurrency (e.g. completed = "
+        "2*C), producing an apparently non-monotonic throughput curve "
+        "despite zero request failures, zero preemptions, and bounded "
+        "drains. See the completion_clustering diagnostic in each point "
+        "summary and the startup_ramp mechanism before drawing any "
+        "output-heavy capacity conclusion; re-profiling on real hardware "
+        "with ramping enabled has not yet been performed."
+    ),
 }
 
 TransportError = smoke.TransportError
@@ -751,13 +799,31 @@ class TelemetryConfig:
 
 @dataclass(frozen=True)
 class TimingConfig:
-    """Per-point phase timing (D9). Defaults are pilot values, not final."""
+    """Per-point phase timing (D9). Defaults are pilot values, not final.
+
+    ``ramp_admission_interval_seconds`` controls the deterministic initial-
+    admission ramp (see :func:`run_load_point`): consecutive initial
+    admissions (the first ``concurrency`` requests of a point, before
+    settling begins) are spaced this many seconds apart instead of being
+    submitted in one immediate burst. ``0.0`` (the pre-ramp behavior) fully
+    disables ramping for exact A/B comparison against earlier artifacts.
+
+    ``burst_window_seconds`` and ``near_concurrency_burst_threshold_fraction``
+    configure the completion-burst diagnostic (see
+    :func:`summarize_completion_clustering`); they are purely diagnostic and
+    never affect measurement validity or capacity arithmetic.
+    """
 
     settling_seconds: float = DEFAULT_SETTLING_SECONDS
     measurement_seconds: float = DEFAULT_MEASUREMENT_SECONDS
     drain_timeout_seconds: float = DEFAULT_DRAIN_TIMEOUT_SECONDS
     metrics_interval_seconds: float = DEFAULT_METRICS_INTERVAL_SECONDS
     request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS
+    ramp_admission_interval_seconds: float = DEFAULT_RAMP_ADMISSION_INTERVAL_SECONDS
+    burst_window_seconds: float = DEFAULT_BURST_WINDOW_SECONDS
+    near_concurrency_burst_threshold_fraction: float = (
+        DEFAULT_NEAR_CONCURRENCY_BURST_THRESHOLD_FRACTION
+    )
 
     def validate(self) -> None:
         for name in (
@@ -770,9 +836,263 @@ class TimingConfig:
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
                 raise ProfilingError(f"{name} must be finite and positive")
+        if (
+            not math.isfinite(self.ramp_admission_interval_seconds)
+            or self.ramp_admission_interval_seconds < 0
+        ):
+            raise ProfilingError(
+                "ramp_admission_interval_seconds must be finite and non-negative "
+                "(0 disables ramping)"
+            )
+        if (
+            not math.isfinite(self.burst_window_seconds)
+            or self.burst_window_seconds < 0
+        ):
+            raise ProfilingError(
+                "burst_window_seconds must be finite and non-negative"
+            )
+        if not (0 < self.near_concurrency_burst_threshold_fraction <= 1):
+            raise ProfilingError(
+                "near_concurrency_burst_threshold_fraction must be in (0, 1]"
+            )
 
 
 IdleCheck = Callable[[], tuple[bool, str | None]]
+
+
+# ---------------------------------------------------------------------------
+# Completion-burst / phase-synchronization diagnostic
+#
+# Real output-heavy profiling exposed a suspicious pattern: several
+# concurrency points completed near-exact multiples of the target
+# concurrency C within one measurement window (e.g. completed = 2*C), with
+# an apparently non-monotonic throughput curve, despite zero request
+# failures, zero preemptions, and bounded drains. Since every bucket's
+# records share one fixed target_output_tokens, and the current admission
+# loop submits its initial C requests as fast as the calling thread can
+# call executor.submit() in a tight for-loop (no delay at all -- see
+# run_load_point), the initial C requests are dispatched within a narrow
+# real-time burst. For a bucket whose records all decode to the same
+# length, near-simultaneously started requests can progress through decode
+# together and terminate close together, and their closed-loop replacements
+# can then re-enter together, preserving a "completion wave" structure
+# indefinitely. This is architecture-level evidence supporting the
+# phase-synchronization hypothesis independent of the diagnostic below.
+#
+# CORRECTED ALGORITHM (this diagnostic previously used single-linkage/
+# nearest-neighbor-chain clustering: a timestamp joined a cluster iff it
+# was within a tolerance of the immediately PREVIOUS timestamp already in
+# that cluster). That chains transitively: a perfectly healthy, continuous,
+# high-throughput completion stream with small adjacent gaps (e.g. a
+# steady ~3-4 req/s output-heavy stream, gaps ~0.25-0.33s, well under a
+# 0.5s tolerance) would be merged into ONE arbitrarily large "cluster"
+# spanning the entire measurement window, producing a false-positive
+# phase_synchronization_suspected verdict on exactly the real regime this
+# diagnostic exists to check. This has been replaced with a non-chaining,
+# FIXED-WIDTH burst-window diagnostic: membership is always bounded by a
+# distance to a fixed window anchor, never by transitive adjacency to a
+# chain of neighbors, so a continuous stream can never accumulate into one
+# giant burst merely because each individual gap is small.
+#
+# This diagnostic turns that qualitative pattern into a deterministic,
+# reproducible measurement over a point's own request_results.jsonl
+# terminal timestamps. It is evidence for HUMAN REVIEW only: it never
+# changes run_valid, never changes capacity arithmetic, and never selects
+# or rejects a plateau by itself.
+# ---------------------------------------------------------------------------
+
+
+def max_completions_in_fixed_window(
+    timestamps: Sequence[float], window_seconds: float
+) -> tuple[int, float | None]:
+    """Maximum number of timestamps contained in any fixed-width window.
+
+    Returns ``(max_count, window_start)`` where ``window_start`` is the
+    start of one window (there may be ties) achieving ``max_count``, or
+    ``(0, None)`` for an empty input.
+
+    Boundary semantics are exact and non-chaining: for a window anchored at
+    ``window_start``, a timestamp ``t`` is inside the window iff::
+
+        window_start <= t <= window_start + window_seconds
+
+    This is a real two-pointer sliding-window computation over ALL possible
+    real-valued window positions, not merely windows anchored at an
+    existing timestamp: sliding any window left only ever adds or keeps the
+    same timestamps until its left edge reaches the next timestamp, so the
+    true maximum is always achieved by some window anchored exactly at one
+    of the input timestamps. Each timestamp can therefore only ever be
+    counted relative to the window's own fixed anchor -- unlike single-
+    linkage clustering, one timestamp can NEVER transitively pull in
+    another timestamp more than ``window_seconds`` away from that anchor,
+    so a continuous stream of small adjacent gaps cannot accumulate into one
+    arbitrarily large burst. This is O(n log n) (for the initial sort; the
+    sliding-window scan itself is O(n)).
+    """
+
+    if window_seconds < 0 or not math.isfinite(window_seconds):
+        raise ProfilingError("burst window seconds must be finite and non-negative")
+    ordered = sorted(timestamps)
+    if not ordered:
+        return 0, None
+
+    best_count = 0
+    best_start = ordered[0]
+    left = 0
+    for right, right_timestamp in enumerate(ordered):
+        while right_timestamp - ordered[left] > window_seconds:
+            left += 1
+        count = right - left + 1
+        if count > best_count:
+            best_count = count
+            best_start = ordered[left]
+    return best_count, best_start
+
+
+def partition_into_non_overlapping_windows(
+    timestamps: Sequence[float], window_seconds: float
+) -> list[list[float]]:
+    """Greedily partition sorted timestamps into fixed-width, non-overlapping
+    "burst episodes", for secondary repeated-wave human-review evidence.
+
+    Each episode is anchored at the earliest not-yet-assigned timestamp and
+    contains every subsequent timestamp satisfying
+    ``timestamp <= anchor + window_seconds`` (same inclusive boundary as
+    :func:`max_completions_in_fixed_window`); the next episode then starts
+    fresh at the next unassigned timestamp. Episodes never overlap and an
+    episode's width is always bounded by its own anchor, so -- unlike
+    single-linkage clustering -- this cannot chain a continuous stream into
+    one giant episode either. This is intentionally simpler than
+    :func:`max_completions_in_fixed_window` (it does not search all window
+    positions) and is meant only to give a human a quick read on whether
+    *multiple, separated* near-concurrency bursts occurred, matching the
+    real observation of repeated ``completed = k*C`` waves.
+    """
+
+    if window_seconds < 0 or not math.isfinite(window_seconds):
+        raise ProfilingError("burst window seconds must be finite and non-negative")
+    ordered = sorted(timestamps)
+    windows: list[list[float]] = []
+    index = 0
+    while index < len(ordered):
+        anchor = ordered[index]
+        window: list[float] = []
+        while index < len(ordered) and ordered[index] <= anchor + window_seconds:
+            window.append(ordered[index])
+            index += 1
+        windows.append(window)
+    return windows
+
+
+def summarize_completion_clustering(
+    *,
+    results: Sequence[Mapping[str, Any]],
+    t0: float,
+    t1: float,
+    concurrency: int,
+    burst_window_seconds: float = DEFAULT_BURST_WINDOW_SECONDS,
+    near_concurrency_burst_threshold_fraction: float = (
+        DEFAULT_NEAR_CONCURRENCY_BURST_THRESHOLD_FRACTION
+    ),
+) -> dict[str, Any]:
+    """Diagnostic-only completion-burst evidence for one load point.
+
+    Operates on exactly the same population used for the capacity numerator
+    (``in_measurement_window and passed``), so ``completion_count`` here is
+    always equal to the point summary's ``completed_requests_in_window``.
+    Only timestamps satisfying ``t0 <= terminal < t1`` are used, so
+    telemetry/results from another point's window can never leak in.
+
+    This is reusable directly against a real ``request_results.jsonl``
+    artifact: each line already has the ``terminal_monotonic_s``,
+    ``in_measurement_window``, and ``passed`` fields this function reads.
+    """
+
+    if burst_window_seconds < 0 or not math.isfinite(burst_window_seconds):
+        raise ProfilingError("burst window seconds must be finite and non-negative")
+    if not (0 < near_concurrency_burst_threshold_fraction <= 1):
+        raise ProfilingError(
+            "near-concurrency burst threshold fraction must be in (0, 1]"
+        )
+
+    terminals = sorted(
+        result["terminal_monotonic_s"]
+        for result in results
+        if result.get("in_measurement_window")
+        and result.get("passed")
+        and result.get("terminal_monotonic_s") is not None
+        and t0 <= result["terminal_monotonic_s"] < t1
+    )
+    completion_count = len(terminals)
+
+    if completion_count >= 2:
+        gaps = [second - first for first, second in zip(terminals, terminals[1:])]
+        inter_completion_gap_seconds: dict[str, Any] = {
+            "available": True,
+            "count": len(gaps),
+            "min": min(gaps),
+            "max": max(gaps),
+            "avg": sum(gaps) / len(gaps),
+        }
+    else:
+        inter_completion_gap_seconds = {"available": False}
+
+    max_completions, max_burst_window_start = max_completions_in_fixed_window(
+        terminals, burst_window_seconds
+    )
+    max_burst_fraction_of_concurrency = (
+        max_completions / concurrency if concurrency > 0 else None
+    )
+    phase_synchronization_suspected = (
+        max_burst_fraction_of_concurrency is not None
+        and max_burst_fraction_of_concurrency
+        >= near_concurrency_burst_threshold_fraction
+    )
+
+    episodes = partition_into_non_overlapping_windows(terminals, burst_window_seconds)
+    episode_sizes = [len(episode) for episode in episodes]
+    near_concurrency_episode_count = sum(
+        1
+        for size in episode_sizes
+        if concurrency > 0
+        and size >= near_concurrency_burst_threshold_fraction * concurrency
+    )
+
+    return {
+        "diagnostic_purpose": (
+            "Evidence for HUMAN REVIEW of completion-burst / phase-"
+            "synchronization risk (estimator quality). Does not affect "
+            "run_valid and must never be used to automatically accept or "
+            "reject a capacity point or plateau."
+        ),
+        "algorithm": (
+            "fixed_width_sliding_window (non-chaining); see "
+            "max_completions_in_fixed_window"
+        ),
+        "population": "valid_measurement_window_completions",
+        "burst_window_seconds": burst_window_seconds,
+        "near_concurrency_burst_threshold_fraction": (
+            near_concurrency_burst_threshold_fraction
+        ),
+        "completion_count": completion_count,
+        "inter_completion_gap_seconds": inter_completion_gap_seconds,
+        "max_completions_in_burst_window": max_completions,
+        "max_burst_window_start_s": max_burst_window_start,
+        "max_burst_fraction_of_concurrency": max_burst_fraction_of_concurrency,
+        "repeated_burst_episodes": {
+            "note": (
+                "Secondary, simpler evidence: greedy non-overlapping "
+                "fixed-width episodes (not an exhaustive search like "
+                "max_completions_in_burst_window above), for a quick read "
+                "on whether MULTIPLE separated near-concurrency bursts "
+                "occurred."
+            ),
+            "episode_count": len(episodes),
+            "episode_sizes": episode_sizes,
+            "near_concurrency_episode_count": near_concurrency_episode_count,
+        },
+        "phase_synchronization_suspected": phase_synchronization_suspected,
+    }
 
 
 def summarize_point(
@@ -791,6 +1111,9 @@ def summarize_point(
     drain_duration: float,
     drained: bool,
     extra_invalidation_reasons: Sequence[str] = (),
+    ramp_admission_interval_seconds: float = 0.0,
+    ramp_start: float | None = None,
+    target_concurrency_reached: float | None = None,
 ) -> dict[str, Any]:
     """Pure summary computation for one load point (D12/D16), no threading.
 
@@ -798,7 +1121,19 @@ def summarize_point(
     testable with synthetic per-request results. The token-rate invariant is
     derived from ``bucket.total_target_tokens`` rather than a hard-coded
     constant, so it remains correct for any approved bucket.
+
+    ``ramp_admission_interval_seconds``/``ramp_start``/
+    ``target_concurrency_reached`` are optional startup-ramp auditability
+    fields (see :func:`run_load_point`); omitting them (as every pre-ramp
+    caller/test does) yields a zero-duration, disabled-ramp record anchored
+    at ``t_start``, which is exactly the historical burst-admission
+    behavior.
     """
+
+    if ramp_start is None:
+        ramp_start = t_start
+    if target_concurrency_reached is None:
+        target_concurrency_reached = t_start
 
     invalidation_reasons = list(extra_invalidation_reasons)
 
@@ -869,6 +1204,13 @@ def summarize_point(
             "holds": invariant_holds,
         },
         "adjacent_throughput_gain": None,
+        "startup_ramp": {
+            "ramp_admission_interval_seconds": ramp_admission_interval_seconds,
+            "ramp_enabled": ramp_admission_interval_seconds > 0,
+            "ramp_start_s": ramp_start,
+            "target_concurrency_reached_s": target_concurrency_reached,
+            "ramp_duration_s": target_concurrency_reached - ramp_start,
+        },
         "capacity_quantity_warning": (
             "This is monolithic non-P/D V_M evidence using L_in+L_out total "
             "tokens; it is not physical KV-release throughput, not isolated "
@@ -890,6 +1232,38 @@ def compute_adjacent_gain(
         return None
     current_rate = current_summary["completed_total_tokens_per_second"]
     return (current_rate - previous_rate) / previous_rate
+
+
+def _classify_result_window(
+    result: Mapping[str, Any], *, ramp_end: float, t0: float, t1: float
+) -> dict[str, Any]:
+    """Annotate one raw execution result with its window/phase membership.
+
+    This is deliberately deferred until ``ramp_end``/``t0``/``t1`` are all
+    finalized (i.e. until the initial ramp has finished admitting the full
+    target concurrency), rather than being computed live inside the
+    completion callback. A request admitted early in the ramp can finish
+    before the ramp itself finishes admitting later requests, so computing
+    ``t0``/``t1`` only once the ramp completes -- as required for the ramp
+    semantics -- would otherwise race with an in-flight callback that still
+    needed them.
+    """
+
+    result = dict(result)
+    terminal = result.get("terminal_monotonic_s")
+    in_window = terminal is not None and t0 <= terminal < t1
+    result["in_measurement_window"] = in_window
+    if terminal is None:
+        result["phase"] = "unknown"
+    elif terminal < ramp_end:
+        result["phase"] = "ramp"
+    elif terminal < t0:
+        result["phase"] = "settling"
+    elif terminal < t1:
+        result["phase"] = "measurement"
+    else:
+        result["phase"] = "drain"
+    return result
 
 
 def run_load_point(
@@ -925,6 +1299,18 @@ def run_load_point(
     a gap: a failed precondition was recorded, but the closed-loop executor
     still ran and could flood a down server with tens of thousands of
     immediately-failing HTTP requests before the bounded window elapsed.
+
+    Deterministic initial-admission ramp: the initial ``concurrency``
+    requests are admitted one at a time, ``timing.
+    ramp_admission_interval_seconds`` apart (``0`` reproduces the historical
+    immediate-burst admission exactly). Settling begins only once the full
+    target concurrency has actually been admitted (``ramp_end``); ``t0``/
+    ``t1`` are derived from that instant exactly as before, so ramp time is
+    never counted as settling or measurement time, and the measurement
+    denominator (``timing.measurement_seconds``) is unaffected. Once the
+    ramp completes, every replacement admission during settling/measurement/
+    drain is issued immediately by the completion callback, exactly as
+    before -- the ramp applies ONLY to a point's very first admissions.
     """
 
     if concurrency <= 0:
@@ -967,6 +1353,9 @@ def run_load_point(
             drain_duration=0.0,
             drained=True,
             extra_invalidation_reasons=extra_invalidation_reasons,
+            ramp_admission_interval_seconds=timing.ramp_admission_interval_seconds,
+            ramp_start=skip_t_start,
+            target_concurrency_reached=skip_t_start,
         )
         summary["execution_skipped"] = True
         summary["execution_skipped_reason"] = (
@@ -980,6 +1369,16 @@ def run_load_point(
             "available": False,
             "reason": "execution_skipped_precondition_failed",
         }
+        summary["completion_clustering"] = summarize_completion_clustering(
+            results=[],
+            t0=skip_t0,
+            t1=skip_t1,
+            concurrency=concurrency,
+            burst_window_seconds=timing.burst_window_seconds,
+            near_concurrency_burst_threshold_fraction=(
+                timing.near_concurrency_burst_threshold_fraction
+            ),
+        )
         return summary, []
 
     local_vllm_samples: list[dict[str, Any]] = []
@@ -1018,10 +1417,6 @@ def run_load_point(
     submitted_count = 0
     admission_closed = threading.Event()
     all_drained = threading.Event()
-
-    t_start = clock()
-    t0 = t_start + timing.settling_seconds
-    t1 = t0 + timing.measurement_seconds
 
     executor = ThreadPoolExecutor(
         max_workers=concurrency, thread_name_prefix=f"profile-c{concurrency}"
@@ -1079,21 +1474,16 @@ def run_load_point(
                 "terminal_monotonic_s": clock(),
                 "latency_s": None,
             }
-        terminal = result.get("terminal_monotonic_s")
-        in_window = terminal is not None and t0 <= terminal < t1
+        # Window/phase membership (in_measurement_window, phase) is
+        # deliberately NOT computed here. It is computed once, for every
+        # result, only after the initial ramp has finished admitting the
+        # full target concurrency and t0/t1 are therefore finalized (see
+        # _classify_result_window below) -- an early ramp admission can
+        # complete before later ramp admissions are even issued.
         result = dict(result)
         result["run_id"] = run_id
         result["concurrency"] = concurrency
         result["sequence"] = sequence
-        result["in_measurement_window"] = in_window
-        if terminal is None:
-            result["phase"] = "unknown"
-        elif terminal < t0:
-            result["phase"] = "settling"
-        elif terminal < t1:
-            result["phase"] = "measurement"
-        else:
-            result["phase"] = "drain"
 
         with results_lock:
             results.append(result)
@@ -1108,8 +1498,28 @@ def run_load_point(
         if not admission_closed.is_set():
             submit_one()
 
-    for _ in range(concurrency):
+    # Deterministic initial-admission ramp (D7 requirement 7/8/9/13/14): the
+    # first `concurrency` admissions are spaced ramp_admission_interval
+    # seconds apart instead of being submitted in one immediate burst.
+    # `submit_one()` itself is completely unchanged; only the pacing of
+    # these specific `concurrency` calls differs. Every later replacement
+    # admission (issued from _on_done during settling/measurement/drain)
+    # remains immediate, exactly as before.
+    ramp_admission_interval = timing.ramp_admission_interval_seconds
+    ramp_start = clock()
+    for admission_index in range(concurrency):
+        if admission_index > 0 and ramp_admission_interval > 0:
+            sleep(ramp_admission_interval)
         submit_one()
+    ramp_end = clock()  # full target concurrency has now been admitted
+
+    # Settling begins only once the full target concurrency has actually
+    # been reached, so t0/t1 must be derived from ramp_end, not ramp_start.
+    # With ramp_admission_interval_seconds == 0 (the pre-ramp default),
+    # ramp_start == ramp_end and this is exactly the historical behavior.
+    t_start = ramp_end
+    t0 = t_start + timing.settling_seconds
+    t1 = t0 + timing.measurement_seconds
 
     remaining_to_t1 = t1 - clock()
     if remaining_to_t1 > 0:
@@ -1139,7 +1549,10 @@ def run_load_point(
             extra_invalidation_reasons.append(f"server_unreachable_after_point:{reason}")
 
     with results_lock:
-        results_snapshot = list(results)
+        results_snapshot = [
+            _classify_result_window(result, ramp_end=ramp_end, t0=t0, t1=t1)
+            for result in results
+        ]
 
     summary = summarize_point(
         bucket=bucket,
@@ -1156,8 +1569,21 @@ def run_load_point(
         drain_duration=drain_duration,
         drained=drained,
         extra_invalidation_reasons=extra_invalidation_reasons,
+        ramp_admission_interval_seconds=ramp_admission_interval,
+        ramp_start=ramp_start,
+        target_concurrency_reached=ramp_end,
     )
     summary["execution_skipped"] = False
+    summary["completion_clustering"] = summarize_completion_clustering(
+        results=results_snapshot,
+        t0=t0,
+        t1=t1,
+        concurrency=concurrency,
+        burst_window_seconds=timing.burst_window_seconds,
+        near_concurrency_burst_threshold_fraction=(
+            timing.near_concurrency_burst_threshold_fraction
+        ),
+    )
 
     if telemetry_config is not None:
         with local_telemetry_lock:
@@ -1381,6 +1807,41 @@ def build_manifest(
             "drain_timeout_seconds": config.timing.drain_timeout_seconds,
             "metrics_interval_seconds": config.timing.metrics_interval_seconds,
             "request_timeout_seconds": config.timing.request_timeout_seconds,
+        },
+        "startup_ramp": {
+            "policy": "fixed_interval_between_initial_admissions",
+            "ramp_admission_interval_seconds": (
+                config.timing.ramp_admission_interval_seconds
+            ),
+            "enabled": config.timing.ramp_admission_interval_seconds > 0,
+            "note": (
+                "Deterministic, non-adaptive stagger applied ONLY to the "
+                "initial `concurrency` admissions of each load point, "
+                "before settling begins; every later replacement admission "
+                "during settling/measurement/drain remains immediate. Ramp "
+                "duration for one point with target concurrency C is "
+                "(C - 1) * ramp_admission_interval_seconds. This never "
+                "changes target concurrency, [T0,T1) semantics, the "
+                "measurement denominator, or capacity arithmetic. Actual "
+                "per-point ramp_start_s/target_concurrency_reached_s are "
+                "recorded in point_summaries.jsonl's startup_ramp block. "
+                "0 reproduces the original immediate-burst admission "
+                "exactly, for A/B comparison against pre-ramp artifacts."
+            ),
+        },
+        "completion_clustering_diagnostic": {
+            "algorithm": "fixed_width_sliding_window (non-chaining)",
+            "burst_window_seconds": config.timing.burst_window_seconds,
+            "near_concurrency_burst_threshold_fraction": (
+                config.timing.near_concurrency_burst_threshold_fraction
+            ),
+            "note": (
+                "Diagnostic-only phase-synchronization/completion-burst "
+                "evidence, computed per point from request_results.jsonl "
+                "terminal timestamps and recorded in each point summary's "
+                "completion_clustering block. Never affects run_valid and "
+                "never selects or rejects a plateau; see README."
+            ),
         },
         "base_url": config.base_url,
         "runtime_launch_assumptions": {
@@ -1675,6 +2136,38 @@ def build_argument_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_REQUEST_TIMEOUT_SECONDS,
     )
+    parser.add_argument(
+        "--ramp-admission-interval-seconds",
+        type=float,
+        default=DEFAULT_RAMP_ADMISSION_INTERVAL_SECONDS,
+        help=(
+            "deterministic spacing between each of the initial `concurrency` "
+            "admissions of a load point (before settling begins); 0 "
+            "reproduces the original immediate-burst admission for exact "
+            "A/B comparison"
+        ),
+    )
+    parser.add_argument(
+        "--burst-window-seconds",
+        type=float,
+        default=DEFAULT_BURST_WINDOW_SECONDS,
+        help=(
+            "fixed-width window used by the non-chaining completion-burst "
+            "diagnostic: a timestamp t is inside a window anchored at "
+            "window_start iff window_start <= t <= window_start + "
+            "burst_window_seconds (diagnostic only)"
+        ),
+    )
+    parser.add_argument(
+        "--near-concurrency-burst-threshold-fraction",
+        type=float,
+        default=DEFAULT_NEAR_CONCURRENCY_BURST_THRESHOLD_FRACTION,
+        help=(
+            "fraction of target concurrency a burst window must reach to "
+            "count as a near-concurrency (suspected synchronized) burst "
+            "(diagnostic only)"
+        ),
+    )
     parser.add_argument("--run-id", default="")
     parser.add_argument(
         "--no-telemetry",
@@ -1706,6 +2199,11 @@ def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
             drain_timeout_seconds=args.drain_timeout_seconds,
             metrics_interval_seconds=args.metrics_interval_seconds,
             request_timeout_seconds=args.request_timeout_seconds,
+            ramp_admission_interval_seconds=args.ramp_admission_interval_seconds,
+            burst_window_seconds=args.burst_window_seconds,
+            near_concurrency_burst_threshold_fraction=(
+                args.near_concurrency_burst_threshold_fraction
+            ),
         ),
         run_id=args.run_id or default_run_id(args.bucket),
         collect_telemetry=not args.no_telemetry,
