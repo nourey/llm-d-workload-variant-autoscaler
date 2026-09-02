@@ -915,6 +915,16 @@ def run_load_point(
     (for full archival) AND kept in a point-local copy used only to compute
     this point's own measurement-window telemetry summaries, so telemetry
     can never leak across points.
+
+    Fail-closed precondition behavior: if ``idle_check`` reports the
+    mandatory precondition as failed (e.g. the server is unreachable), this
+    function returns an explicit no-execution invalid point immediately. It
+    does not start telemetry, does not create request workers, does not
+    admit any request, and therefore cannot generate request-execution HTTP
+    traffic against an unavailable/misconfigured server. This was previously
+    a gap: a failed precondition was recorded, but the closed-loop executor
+    still ran and could flood a down server with tens of thousands of
+    immediately-failing HTTP requests before the bounded window elapsed.
     """
 
     if concurrency <= 0:
@@ -922,11 +932,55 @@ def run_load_point(
     timing.validate()
 
     extra_invalidation_reasons: list[str] = []
+    precondition_ok = True
+    precondition_reason: str | None = None
 
     if idle_check is not None:
-        ok, reason = idle_check()
-        if not ok:
-            extra_invalidation_reasons.append(f"precondition_failed:{reason}")
+        precondition_ok, precondition_reason = idle_check()
+        if not precondition_ok:
+            extra_invalidation_reasons.append(
+                f"precondition_failed:{precondition_reason}"
+            )
+
+    if not precondition_ok:
+        # Fail closed: no telemetry, no executor, no admitted requests, no
+        # settling/measurement/drain execution of any kind for this point.
+        # These timestamps are nominal (no real settling/measurement time
+        # ever elapses); the normal execution path below computes its own
+        # t_start/t0/t1 at its original point in the control flow, so this
+        # early return cannot shift timing for points that actually run.
+        skip_t_start = clock()
+        skip_t0 = skip_t_start + timing.settling_seconds
+        skip_t1 = skip_t0 + timing.measurement_seconds
+        summary = summarize_point(
+            bucket=bucket,
+            concurrency=concurrency,
+            results=[],
+            max_observed_concurrency=0,
+            t_start=skip_t_start,
+            t0=skip_t0,
+            t1=skip_t1,
+            measurement_seconds=timing.measurement_seconds,
+            submitted_count=0,
+            outstanding_at_t1=0,
+            outstanding_after_drain=0,
+            drain_duration=0.0,
+            drained=True,
+            extra_invalidation_reasons=extra_invalidation_reasons,
+        )
+        summary["execution_skipped"] = True
+        summary["execution_skipped_reason"] = (
+            f"precondition_failed:{precondition_reason}"
+        )
+        summary["vllm_telemetry"] = {
+            "available": False,
+            "reason": "execution_skipped_precondition_failed",
+        }
+        summary["gpu_telemetry"] = {
+            "available": False,
+            "reason": "execution_skipped_precondition_failed",
+        }
+        return summary, []
 
     local_vllm_samples: list[dict[str, Any]] = []
     local_gpu_samples: list[dict[str, Any]] = []
@@ -1103,6 +1157,7 @@ def run_load_point(
         drained=drained,
         extra_invalidation_reasons=extra_invalidation_reasons,
     )
+    summary["execution_skipped"] = False
 
     if telemetry_config is not None:
         with local_telemetry_lock:

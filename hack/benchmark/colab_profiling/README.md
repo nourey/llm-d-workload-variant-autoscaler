@@ -365,10 +365,18 @@ directory's contents are self-describing even out of context.
 Each concurrency point runs through explicit phases (D9): an idle/precondition
 check against `/v1/models`, a settling/warm-up period, a fixed measurement
 window `[T0, T1)`, admission stop at `T1`, a bounded drain, a post-run
-precondition re-check, and finally the summary/artifact write. Only
-requests whose **server-validated** completion lands inside `[T0, T1)` are
-counted in the numerator (D3/D10); settling and drain completions are
-retained only as bookkeeping.
+precondition re-check, and finally the summary/artifact write. **The
+precondition check fails closed**: if it fails, the point does not start
+telemetry, does not create request workers, and does not admit a single
+request — it returns an immediately invalid, zero-execution point summary
+(`requests_submitted = 0`, `max_observed_concurrency = 0`,
+`completed_requests_in_window = 0`, `completed_requests_per_second = 0`,
+`completed_total_tokens_per_second = 0`, `outstanding_at_t1 = 0`,
+`outstanding_after_drain = 0`, `execution_skipped = true`) with the concrete
+precondition failure reason preserved in `invalidation_reasons` and
+`execution_skipped_reason`. Only requests whose **server-validated**
+completion lands inside `[T0, T1)` are counted in the numerator (D3/D10);
+settling and drain completions are retained only as bookkeeping.
 
 For every currently approved bucket, `total_target_tokens = 512`, so
 `completed_total_tokens_per_second` must equal
@@ -401,6 +409,19 @@ summary.
 
 ### Known limitations / risks not yet resolved by local tests
 
+* **Resolved defect (fail-closed preconditions):** a real fresh-runtime
+  input-heavy repeatability run once started a `C=48` point while the vLLM
+  server was briefly unreachable. The precondition probe correctly failed
+  with `Connection refused`, but `run_load_point()` still entered the
+  closed-loop executor and generated approximately 25,069 immediately-failing
+  HTTP requests against the down server before the bounded window elapsed;
+  the point was still (correctly) discarded as invalid, but it should never
+  have generated that traffic. This is fixed: a failed precondition now
+  prevents telemetry from starting and prevents any request worker or HTTP
+  request from being created for that point at all (see above). This does
+  **not** change `[T0, T1)` semantics, concurrency semantics, the request
+  contract, capacity arithmetic, or telemetry interpretation for points that
+  do execute.
 * The closed-loop scheduler uses a bounded Python thread pool (not
   `asyncio`) as the concurrency-limiting mechanism, since this directory's
   existing components deliberately use only the Python standard library. At

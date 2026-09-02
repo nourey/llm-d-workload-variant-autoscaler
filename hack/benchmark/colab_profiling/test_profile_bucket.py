@@ -710,6 +710,34 @@ class RunLoadPointTests(unittest.TestCase):
             )
         )
 
+    def test_successful_precondition_still_executes_normally(self) -> None:
+        # Guard against a fail-closed fix accidentally also short-circuiting
+        # the healthy path.
+        transport = DelayedTransport(delay_seconds=0.01)
+        timing = profiler.TimingConfig(
+            settling_seconds=0.02,
+            measurement_seconds=0.05,
+            drain_timeout_seconds=2.0,
+            metrics_interval_seconds=1.0,
+            request_timeout_seconds=5.0,
+        )
+        summary, results = profiler.run_load_point(
+            concurrency=2,
+            cycle=self.cycle,
+            endpoint=self.endpoint,
+            model=MODEL,
+            bucket=self.bucket,
+            timing=timing,
+            transport=transport,
+            idle_check=always_ok_idle_check,
+            run_id="test-run",
+        )
+        self.assertFalse(summary["execution_skipped"])
+        self.assertGreater(transport.call_count, 0)
+        self.assertGreater(summary["requests_submitted"], 0)
+        self.assertGreater(summary["max_observed_concurrency"], 0)
+        self.assertGreater(len(results), 0)
+
     def test_measurement_window_membership_by_terminal_timestamp(self) -> None:
         transport = DelayedTransport(delay_seconds=0.01)
         timing = profiler.TimingConfig(
@@ -810,6 +838,161 @@ class RunLoadPointTests(unittest.TestCase):
         )
         self.assertFalse(summary["vllm_telemetry"]["available"])
         self.assertFalse(summary["gpu_telemetry"]["available"])
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed precondition behavior (real Colab defect regression coverage)
+#
+# A fresh-runtime input-heavy repeatability run once started a C=48 point
+# while the server was briefly unreachable. The precondition probe correctly
+# failed, but run_load_point() still entered the closed-loop executor and
+# generated ~25,069 immediately-failing HTTP requests before the bounded
+# window elapsed. A failed mandatory precondition must prevent ALL load
+# generation for that point, not merely mark it invalid afterward.
+# ---------------------------------------------------------------------------
+
+
+def failing_idle_check_with_reason(reason: str) -> profiler.IdleCheck:
+    def _idle_check() -> tuple[bool, str]:
+        return False, reason
+
+    return _idle_check
+
+
+class FailedPreconditionFailsClosedTests(unittest.TestCase):
+    def setUp(self) -> None:
+        all_records = make_records(64)
+        self.bucket = generator.DEFAULT_BUCKETS[1]  # "balanced"
+        self.records = profiler.select_bucket_records(all_records, self.bucket.name)
+        self.cycle = profiler.PromptCycle(self.records)
+        self.endpoint = "http://127.0.0.1:8000/v1/completions"
+        # Generous timing that would otherwise sustain many closed-loop
+        # cycles if execution were (incorrectly) allowed to proceed.
+        self.timing = profiler.TimingConfig(
+            settling_seconds=0.05,
+            measurement_seconds=0.2,
+            drain_timeout_seconds=1.0,
+            metrics_interval_seconds=0.02,
+            request_timeout_seconds=5.0,
+        )
+
+    def _run(self, concurrency: int, transport, telemetry_config=None):
+        return profiler.run_load_point(
+            concurrency=concurrency,
+            cycle=self.cycle,
+            endpoint=self.endpoint,
+            model=MODEL,
+            bucket=self.bucket,
+            timing=self.timing,
+            transport=transport,
+            idle_check=failing_idle_check_with_reason("Connection refused"),
+            telemetry_config=telemetry_config,
+            run_id="test-run",
+        )
+
+    def test_zero_transport_calls_on_failed_precondition(self) -> None:
+        transport = DelayedTransport(delay_seconds=0.0)
+        summary, results = self._run(concurrency=48, transport=transport)
+        self.assertEqual(transport.call_count, 0)
+        self.assertEqual(results, [])
+
+    def test_requests_submitted_and_max_concurrency_are_zero(self) -> None:
+        transport = DelayedTransport(delay_seconds=0.0)
+        summary, _ = self._run(concurrency=48, transport=transport)
+        self.assertEqual(summary["requests_submitted"], 0)
+        self.assertEqual(summary["max_observed_concurrency"], 0)
+        self.assertEqual(summary["completed_requests_in_window"], 0)
+        self.assertEqual(summary["completed_requests_per_second"], 0)
+        self.assertEqual(summary["completed_total_tokens_per_second"], 0)
+        self.assertEqual(summary["outstanding_at_t1"], 0)
+        self.assertEqual(summary["outstanding_after_drain"], 0)
+
+    def test_point_is_invalid_with_concrete_reason_retained(self) -> None:
+        transport = DelayedTransport(delay_seconds=0.0)
+        summary, _ = self._run(concurrency=48, transport=transport)
+        self.assertFalse(summary["run_valid"])
+        self.assertIn(
+            "precondition_failed:Connection refused", summary["invalidation_reasons"]
+        )
+        self.assertTrue(summary["execution_skipped"])
+        self.assertEqual(
+            summary["execution_skipped_reason"], "precondition_failed:Connection refused"
+        )
+
+    def test_no_settling_or_measurement_execution_occurs(self) -> None:
+        # Independent proof, beyond the transport call counter: no
+        # per-request result records were ever produced at all, for any
+        # phase (settling/measurement/drain).
+        transport = DelayedTransport(delay_seconds=0.0)
+        _, results = self._run(concurrency=48, transport=transport)
+        self.assertEqual(len(results), 0)
+
+    def test_telemetry_is_not_started_when_precondition_fails(self) -> None:
+        vllm_calls = {"count": 0}
+        gpu_calls = {"count": 0}
+
+        def counting_metrics_transport(endpoint, timeout):
+            vllm_calls["count"] += 1
+            return smoke.HttpResponse(200, b"vllm:num_requests_running 0\n")
+
+        def counting_gpu_sampler():
+            gpu_calls["count"] += 1
+            return {"available": False, "error": "should never be called"}
+
+        telemetry_config = profiler.TelemetryConfig(
+            metrics_endpoint="http://x/metrics",
+            metrics_transport=counting_metrics_transport,
+            gpu_sampler=counting_gpu_sampler,
+            interval_seconds=0.01,
+            request_timeout_seconds=5.0,
+        )
+        transport = DelayedTransport(delay_seconds=0.0)
+        summary, _ = self._run(
+            concurrency=48, transport=transport, telemetry_config=telemetry_config
+        )
+        # Give any (incorrectly) started background sampler thread a chance
+        # to have fired at least once before asserting it never did.
+        time.sleep(0.1)
+        self.assertEqual(vllm_calls["count"], 0)
+        self.assertEqual(gpu_calls["count"], 0)
+        self.assertFalse(summary["vllm_telemetry"]["available"])
+        self.assertFalse(summary["gpu_telemetry"]["available"])
+        self.assertEqual(
+            summary["vllm_telemetry"]["reason"], "execution_skipped_precondition_failed"
+        )
+        self.assertEqual(
+            summary["gpu_telemetry"]["reason"], "execution_skipped_precondition_failed"
+        )
+
+    def test_fails_closed_regardless_of_requested_concurrency(self) -> None:
+        for concurrency in (1, 4, 48, 64):
+            with self.subTest(concurrency=concurrency):
+                transport = DelayedTransport(delay_seconds=0.0)
+                summary, results = self._run(concurrency=concurrency, transport=transport)
+                self.assertEqual(transport.call_count, 0)
+                self.assertEqual(len(results), 0)
+                self.assertEqual(summary["requests_submitted"], 0)
+                self.assertEqual(summary["max_observed_concurrency"], 0)
+                self.assertFalse(summary["run_valid"])
+
+    def test_no_idle_check_configured_still_executes_normally(self) -> None:
+        # Fail-closed behavior must only trigger when a precondition check
+        # is actually configured and it actually fails.
+        transport = DelayedTransport(delay_seconds=0.01)
+        summary, results = profiler.run_load_point(
+            concurrency=2,
+            cycle=self.cycle,
+            endpoint=self.endpoint,
+            model=MODEL,
+            bucket=self.bucket,
+            timing=self.timing,
+            transport=transport,
+            idle_check=None,
+            run_id="test-run",
+        )
+        self.assertFalse(summary["execution_skipped"])
+        self.assertGreater(transport.call_count, 0)
+        self.assertGreater(summary["requests_submitted"], 0)
 
 
 # ---------------------------------------------------------------------------
