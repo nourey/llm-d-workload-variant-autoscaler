@@ -191,7 +191,7 @@ per run:
 | --- | ---: | ---: | ---: | --- |
 | `balanced` | 256 | 256 | 512 | **VALIDATED** on real Tesla T4 hardware (see below) |
 | `input-heavy` | 384 | 128 | 512 | **VALIDATED** on independent real Tesla T4 hardware |
-| `output-heavy` | 128 | 384 | 512 | **NOT YET VALIDATED** (see below) |
+| `output-heavy` | 128 | 384 | 512 | **UNDER HUMAN VALIDATION** (see below) |
 
 **Balanced-bucket result (already validated, do not re-derive from local
 tests):** two independent 180s confirmation runs, on independent Tesla T4
@@ -214,13 +214,24 @@ empirical monolithic capacity `V_M^(input-heavy) ≈ 1820 logical token/s`.
 Both conclusions were reached by HUMAN REVIEW of real Colab evidence, not by
 this repository's code.
 
-**Output-heavy is NOT YET VALIDATED.** Real-runtime profiling exposed a
-suspected initial-admission phase-synchronization / completion-wave
-aliasing artifact — see
+**Output-heavy is UNDER HUMAN VALIDATION (not yet accepted).** A
+deterministic startup ramp was added and ramped real-runtime re-profiling
+WAS performed on real Tesla T4 hardware: the non-chaining completion-burst
+diagnostic found NO near-concurrency completion-wave synchronization after
+ramping, ruling out startup phase-synchronization as the main explanation
+for the originally observed anomaly. The terminal-completion estimator
+nonetheless remained materially boundary-sensitive for this long-output
+bucket, which is why engine-side vLLM counter throughput is now the
+PRIMARY capacity estimator for every bucket — see
+["Primary capacity estimator: engine-side token-counter throughput"](#primary-capacity-estimator-engine-side-token-counter-throughput)
+and
 ["Output-heavy completion-wave risk"](#output-heavy-completion-wave-risk-estimator-quality-vs-measurement-validity)
-below before running or interpreting output-heavy results. Do not treat any
-output-heavy number as validated until this has been resolved on real
-hardware and reviewed the same way as balanced/input-heavy.
+below. Real evidence up to `C=288` suggests output-heavy engine throughput
+is approaching its maximum region, but one concurrency point (`C=160`)
+showed an unexplained local dip requiring a clean repeat, and **no
+output-heavy `V_M` value is accepted**. Do not treat any output-heavy
+number as validated until that repeat and a human plateau review are
+complete.
 
 Every run profiles **exactly one** bucket, using **only**
 `profiling.jsonl` records for that bucket (never `heldout.jsonl` and never
@@ -238,10 +249,14 @@ process. It is **not**:
 * SLO-safe operating capacity.
 
 **Plateau acceptance is a HUMAN REVIEW decision.** This tool never selects a
-final `V_M`. It only produces a per-concurrency-point summary table
-(completions/s, total-token/s, adjacent relative throughput gain, run
-validity, and a preemption-delta signal) for a human plus ChatGPT to inspect
-after a real Colab run.
+final `V_M`. It only produces a per-concurrency-point summary table (PRIMARY
+engine-side token/s, adjacent relative throughput gain computed from that
+primary estimator, secondary/boundary-sensitive completion diagnostics,
+running/waiting saturation-ceiling evidence, run validity, and a
+preemption-delta signal) for a human plus ChatGPT to inspect after a real
+Colab run. See
+["Primary capacity estimator"](#primary-capacity-estimator-engine-side-token-counter-throughput)
+below for the exact estimator and fail-closed contract.
 
 ### Prerequisites
 
@@ -438,6 +453,102 @@ that specific point's own `[T0, T1)` window, so telemetry from a different
 concurrency or a different point can never leak into another point's
 summary.
 
+### Primary capacity estimator: engine-side token-counter throughput
+
+The PRIMARY `V_M` capacity estimator for every bucket is:
+
+```
+V_hat_M =
+  (
+    delta(vllm:prompt_tokens_total)
+    +
+    delta(vllm:generation_tokens_total)
+  )
+  /
+  telemetry_duration_s
+```
+
+using the **first and last valid** (`status == "ok"`) vLLM `/metrics`
+samples whose timestamp falls inside the exact measurement interval
+`[T0, T1)`. This is recorded per point as the `engine_token_throughput`
+block in `point_summaries.jsonl`, and it — not terminal-completion
+throughput — is the basis for `adjacent_throughput_gain` and the review
+table's headline numbers.
+
+**Why this is preferred over assigning full request work by terminal
+timestamp.** The previous (still-retained, see below) estimator counts a
+request's entire `L_in + L_out` work at the instant its response
+terminates. For short-output buckets this is a reasonable approximation,
+but for long-output workloads (like `output-heavy`, `L_out = 384`) a
+request's generation can span a large fraction of — or cross — the
+`[T0, T1)` boundary. Terminal-completion accounting then assigns either
+ALL or NONE of that request's tokens to the window, purely based on which
+side of the boundary its one terminal timestamp lands on, while the engine
+itself was actually processing that request's tokens smoothly throughout.
+Real evidence showed this boundary effect is large: roughly -11% to +9%
+differences between the two estimators across output-heavy concurrency
+points. Engine counters increase as work is processed and do not require a
+request to terminate inside the window at all, so they are not subject to
+this aliasing.
+
+**Fail-closed contract (mandatory, no silent fallback).** A point's
+`engine_token_throughput.available` is `false` — and the point is
+therefore marked invalid via an explicit
+`engine_token_throughput_unavailable:<reason>` invalidation reason — if any
+of:
+
+* `vllm:prompt_tokens_total` or `vllm:generation_tokens_total` is missing
+  from either bracket sample (`*_unavailable`);
+* fewer than two valid, in-window telemetry samples exist
+  (`fewer_than_two_valid_telemetry_samples_in_window`);
+* a counter resolves to **more than one** distinct labeled series within
+  one telemetry snapshot (`ambiguous_metric_series:<name>`) — this
+  profiler assumes exactly one engine/model/TP rank, so an ambiguous
+  series is never summed or guessed;
+* the selected series' labels differ between the first and last bracket
+  sample (`*_series_identity_changed`) — the identity of "the" counter
+  must be stable across the window;
+* either counter's last value is less than its first value
+  (`counter_reset_detected`) — counters are monotonic; a decrease is
+  treated as a reset/restart and is **never** wrapped or absolute-valued;
+* the resulting telemetry duration is non-positive
+  (`non_positive_telemetry_duration`).
+
+The engine estimator is **never** silently replaced by the secondary
+completion estimator when unavailable. Consequently, `--no-telemetry` (or
+any run where the server does not expose `vllm:prompt_tokens_total`/
+`vllm:generation_tokens_total`) makes every point invalid.
+
+Each `engine_token_throughput` record also carries
+`telemetry_first_timestamp`/`telemetry_last_timestamp`/
+`telemetry_duration_s` (the **actual** telemetry bracket, never assumed to
+coincide with `T0`/`T1` or with the nominal `measurement_seconds`),
+`prompt_tokens_start/end/delta`, `generation_tokens_start/end/delta`,
+`total_tokens_delta`, `prompt_tokens_per_second`,
+`generation_tokens_per_second`, `total_tokens_per_second`, and
+`selected_series` (the exact metric name and labels used, for
+auditability) — or `unavailable_reason` when unavailable.
+
+**The terminal-completion estimator is retained, not deleted, as a
+secondary diagnostic.** `completed_requests_in_window`,
+`completed_requests_per_second`, and `completed_total_tokens_per_second`
+are still computed and recorded every point (labeled
+`completion_throughput_role: "secondary_boundary_sensitive_completion_diagnostic..."`).
+Each point also carries a `completion_vs_engine` block
+(`completion_vs_engine_ratio`, `completion_vs_engine_percent_difference`)
+comparing the two, purely for human review — it never influences
+`run_valid` or `adjacent_throughput_gain`.
+
+**Saturation/ceiling evidence.** Each point's `saturation_ceiling_evidence`
+block records `concurrency_target`, `max_observed_running`, and
+`max_observed_waiting` from the same telemetry. A persistent running-request
+ceiling below `concurrency_target` together with a nonzero waiting
+population is evidence the *server* (not the client) is limiting
+concurrency — e.g. a `max_num_seqs`-style engine/config limit — and is
+saturation/config-limit evidence for HUMAN REVIEW. This module does not
+infer or hard-code any universal ceiling value from it and never declares a
+plateau from it automatically.
+
 ### Output-heavy completion-wave risk (estimator quality vs. measurement validity)
 
 Real output-heavy profiling exposed a suspicious pattern: several
@@ -547,6 +658,23 @@ recorded for every point (including a trivial all-zero record for a
 precondition-skipped point), but it **never** changes `run_valid`, and this
 tool never uses it to automatically accept, reject, or select a plateau.
 
+**Resolution (ramped re-profiling WAS performed).** The startup ramp
+below and this diagnostic were both exercised on real output-heavy Tesla T4
+hardware. With ramping enabled, the diagnostic found NO near-concurrency
+completion-wave synchronization — the originally observed near-exact
+`completed = k*C` pattern did not recur. This rules out initial-admission
+phase synchronization as the primary cause. However, `completed_total_tokens_per_second`
+still differed materially from `engine_token_throughput.total_tokens_per_second`
+at several concurrency points (roughly -11% to +9%), confirming the
+terminal-completion estimator is genuinely boundary-sensitive for this
+bucket independent of any synchronization artifact. That evidence is why
+engine-side counter throughput is now the PRIMARY estimator (see above) for
+every bucket, not just `output-heavy`. `output-heavy` itself remains under
+human validation: real evidence up to `C=288` is consistent with engine
+throughput approaching its maximum region, but one point (`C=160`) showed
+an unexplained local dip that needs a clean, independent repeat before any
+plateau is reviewed by a human. No output-heavy `V_M` value is accepted.
+
 ### Deterministic initial-admission ramp
 
 The closed-loop scheduler's initial fill — the very first `C` admissions of
@@ -645,6 +773,11 @@ never silently reinterpreted.
   cannot independently inspect the running server's actual launch flags
   beyond `/v1/models` identity and a best-effort `/version` probe, and it
   never modifies the running server.
+* **Behavior change:** since engine-counter throughput is now mandatory,
+  `--no-telemetry` makes every point invalid
+  (`engine_token_throughput_unavailable:telemetry_not_collected`). Use
+  `--no-telemetry` only for harness debugging, never to produce capacity
+  evidence.
 * **Resolved defect (non-chaining completion-burst diagnostic):** the
   completion-clustering diagnostic originally used single-linkage/chained
   clustering, which could merge a perfectly healthy, continuous completion
@@ -656,15 +789,35 @@ never silently reinterpreted.
   always bounded by distance to a fixed window anchor, never by transitive
   adjacency. This is a diagnostic-only change: it does not affect the
   startup ramp, `[T0, T1)` semantics, capacity arithmetic, or `run_valid`.
-* `output-heavy` has a suspected phase-synchronization/completion-burst
-  artifact that has NOT been re-profiled on real hardware with the ramp
-  enabled; see "Output-heavy completion-wave risk" above. `balanced` and
-  `input-heavy` are both validated; `output-heavy` is not.
+* **Adopted fix (engine-counter throughput is now the primary estimator):**
+  ramped real-runtime re-profiling of `output-heavy` WAS performed on real
+  Tesla T4 hardware. The non-chaining completion-burst diagnostic found NO
+  near-concurrency completion-wave synchronization after ramping, ruling
+  out startup phase-synchronization as the main explanation. However, the
+  secondary terminal-completion estimator still differed materially from
+  vLLM's own engine-side counters (roughly -11% to +9% across concurrency
+  points) — expected for a long-output bucket, since terminal-completion
+  accounting assigns a request's full total-token work to its single
+  terminal timestamp, while a request whose generation spans a `[T0,T1)`
+  boundary should contribute smoothly throughout the window. Engine-side
+  counter throughput (`engine_token_throughput.total_tokens_per_second`) is
+  therefore now the PRIMARY capacity estimator for every bucket, and is
+  MANDATORY for a valid point (see "Primary capacity estimator" above); a
+  point without it is invalidated rather than silently falling back to
+  completion throughput.
+* `output-heavy` remains **UNDER HUMAN VALIDATION, not yet accepted**.
+  Real evidence up to `C=288` suggests engine throughput is approaching its
+  maximum region (a persistent running-request ceiling and growing waiting
+  population appear at high offered concurrency — see
+  `saturation_ceiling_evidence`), but one concurrency point (`C=160`)
+  showed an unexplained local engine-throughput dip that requires a clean
+  repeat before any human plateau review. `balanced` and `input-heavy` are
+  both validated; `output-heavy` is not, and no output-heavy `V_M` value is
+  accepted by this repository.
 * The `0.05s` default ramp interval, and the `0.5s` default burst window /
-  `0.8` default near-concurrency threshold, are reasoned defaults
-  (documented above), not values confirmed against real output-heavy
-  hardware evidence yet — re-profiling output-heavy with ramping enabled
-  has not been performed as part of this change.
+  `0.8` default near-concurrency threshold, remain reasoned defaults
+  (documented above); they were not altered by adopting the engine-counter
+  estimator.
 * The completion-burst diagnostic characterizes *client-observed*
   completion timing only; it does not independently confirm *why* requests
   clustered (e.g. it cannot distinguish "vLLM's continuous batching genuinely

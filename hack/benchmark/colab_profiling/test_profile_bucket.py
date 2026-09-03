@@ -468,6 +468,331 @@ class VllmTelemetrySummaryTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Primary V_M estimator: engine-side token-counter throughput
+#
+# Real output-heavy profiling showed terminal-completion throughput
+# (completed_total_tokens_per_second) differs materially -- roughly -11% to
+# +9% in observed evidence -- from vLLM's own engine-side counters. These
+# tests validate the corrected primary estimator directly against
+# synthetic telemetry samples shaped exactly like TelemetrySampler's
+# 'status: ok' entries.
+# ---------------------------------------------------------------------------
+
+
+def engine_sample(
+    timestamp: float,
+    *,
+    prompt: float | None = None,
+    generation: float | None = None,
+    prompt_labels: dict[str, str] | None = None,
+    generation_labels: dict[str, str] | None = None,
+    ambiguous_prompt: bool = False,
+    ambiguous_generation: bool = False,
+    status: str = "ok",
+) -> dict[str, Any]:
+    """Build one synthetic 'status: ok' telemetry sample for engine-counter tests."""
+
+    def entry(
+        value: float | None, labels: dict[str, str] | None, name: str
+    ) -> dict[str, Any]:
+        if value is None:
+            return {"present": False, "samples": []}
+        return {
+            "present": True,
+            "samples": [{"name": name, "labels": labels or {}, "value": value}],
+        }
+
+    known_metrics: dict[str, Any] = {}
+    if ambiguous_prompt:
+        known_metrics["vllm:prompt_tokens_total"] = {
+            "present": True,
+            "samples": [
+                {
+                    "name": "vllm:prompt_tokens_total",
+                    "labels": {"engine": "0"},
+                    "value": 100.0,
+                },
+                {
+                    "name": "vllm:prompt_tokens_total",
+                    "labels": {"engine": "1"},
+                    "value": 200.0,
+                },
+            ],
+        }
+    else:
+        known_metrics["vllm:prompt_tokens_total"] = entry(
+            prompt, prompt_labels, "vllm:prompt_tokens_total"
+        )
+
+    if ambiguous_generation:
+        known_metrics["vllm:generation_tokens_total"] = {
+            "present": True,
+            "samples": [
+                {
+                    "name": "vllm:generation_tokens_total",
+                    "labels": {"engine": "0"},
+                    "value": 50.0,
+                },
+                {
+                    "name": "vllm:generation_tokens_total",
+                    "labels": {"engine": "1"},
+                    "value": 60.0,
+                },
+            ],
+        }
+    else:
+        known_metrics["vllm:generation_tokens_total"] = entry(
+            generation, generation_labels, "vllm:generation_tokens_total"
+        )
+
+    return {"timestamp": timestamp, "status": status, "known_metrics": known_metrics}
+
+
+class SummarizeEngineTokenThroughputTests(unittest.TestCase):
+    def test_exact_delta_computation(self) -> None:
+        samples = [
+            engine_sample(1.0, prompt=1000.0, generation=2000.0),
+            engine_sample(3.0, prompt=1500.0, generation=2400.0),
+        ]
+        summary = profiler.summarize_engine_token_throughput(samples, t0=0.0, t1=10.0)
+        self.assertTrue(summary["available"])
+        self.assertIsNone(summary["unavailable_reason"])
+        self.assertEqual(summary["telemetry_first_timestamp"], 1.0)
+        self.assertEqual(summary["telemetry_last_timestamp"], 3.0)
+        self.assertEqual(summary["telemetry_duration_s"], 2.0)
+        self.assertEqual(summary["prompt_tokens_delta"], 500.0)
+        self.assertEqual(summary["generation_tokens_delta"], 400.0)
+        self.assertEqual(summary["total_tokens_delta"], 900.0)
+        self.assertAlmostEqual(summary["prompt_tokens_per_second"], 250.0)
+        self.assertAlmostEqual(summary["generation_tokens_per_second"], 200.0)
+        self.assertAlmostEqual(summary["total_tokens_per_second"], 450.0)
+        self.assertEqual(
+            summary["selected_series"]["prompt_tokens_total"]["metric_name"],
+            "vllm:prompt_tokens_total",
+        )
+
+    def test_telemetry_timestamps_define_denominator_not_nominal_window(self) -> None:
+        # T0/T1 span 100s, but the actual valid telemetry samples only
+        # bracket a much narrower 4s interval; the denominator must be the
+        # ACTUAL telemetry bracket, not (t1 - t0) or any nominal duration.
+        samples = [
+            engine_sample(10.0, prompt=1000.0, generation=1000.0),
+            engine_sample(14.0, prompt=1040.0, generation=1080.0),
+        ]
+        summary = profiler.summarize_engine_token_throughput(samples, t0=0.0, t1=100.0)
+        self.assertTrue(summary["available"])
+        self.assertEqual(summary["telemetry_duration_s"], 4.0)
+        self.assertAlmostEqual(summary["total_tokens_per_second"], (40.0 + 80.0) / 4.0)
+
+    def test_intermediate_samples_are_ignored_only_bracket_matters(self) -> None:
+        samples = [
+            engine_sample(1.0, prompt=1000.0, generation=1000.0),
+            engine_sample(2.0, prompt=999999.0, generation=999999.0),  # ignored
+            engine_sample(5.0, prompt=1200.0, generation=1150.0),
+        ]
+        summary = profiler.summarize_engine_token_throughput(samples, t0=0.0, t1=10.0)
+        self.assertTrue(summary["available"])
+        self.assertEqual(summary["prompt_tokens_delta"], 200.0)
+        self.assertEqual(summary["generation_tokens_delta"], 150.0)
+
+    def test_prompt_counter_missing_is_unavailable(self) -> None:
+        samples = [
+            engine_sample(1.0, generation=1000.0),
+            engine_sample(2.0, generation=1100.0),
+        ]
+        summary = profiler.summarize_engine_token_throughput(samples, t0=0.0, t1=10.0)
+        self.assertFalse(summary["available"])
+        self.assertIn("prompt_tokens_total_unavailable", summary["unavailable_reason"])
+
+    def test_generation_counter_missing_is_unavailable(self) -> None:
+        samples = [
+            engine_sample(1.0, prompt=1000.0),
+            engine_sample(2.0, prompt=1100.0),
+        ]
+        summary = profiler.summarize_engine_token_throughput(samples, t0=0.0, t1=10.0)
+        self.assertFalse(summary["available"])
+        self.assertIn(
+            "generation_tokens_total_unavailable", summary["unavailable_reason"]
+        )
+
+    def test_fewer_than_two_in_window_samples_is_unavailable(self) -> None:
+        samples = [engine_sample(1.0, prompt=1000.0, generation=1000.0)]
+        summary = profiler.summarize_engine_token_throughput(samples, t0=0.0, t1=10.0)
+        self.assertFalse(summary["available"])
+        self.assertEqual(
+            summary["unavailable_reason"],
+            "fewer_than_two_valid_telemetry_samples_in_window",
+        )
+
+        empty_summary = profiler.summarize_engine_token_throughput(
+            [], t0=0.0, t1=10.0
+        )
+        self.assertFalse(empty_summary["available"])
+        self.assertIsNone(empty_summary["telemetry_first_timestamp"])
+
+    def test_counter_reset_is_detected_not_wrapped_or_absolute_valued(self) -> None:
+        samples = [
+            engine_sample(1.0, prompt=5000.0, generation=5000.0),
+            engine_sample(2.0, prompt=100.0, generation=5100.0),  # prompt reset
+        ]
+        summary = profiler.summarize_engine_token_throughput(samples, t0=0.0, t1=10.0)
+        self.assertFalse(summary["available"])
+        self.assertEqual(summary["unavailable_reason"], "counter_reset_detected")
+        # Must not silently wrap or take an absolute value of the decrease.
+        self.assertIsNone(summary["prompt_tokens_delta"])
+        self.assertIsNone(summary["total_tokens_per_second"])
+
+        generation_reset_samples = [
+            engine_sample(1.0, prompt=1000.0, generation=5000.0),
+            engine_sample(2.0, prompt=1100.0, generation=100.0),
+        ]
+        reset_summary = profiler.summarize_engine_token_throughput(
+            generation_reset_samples, t0=0.0, t1=10.0
+        )
+        self.assertFalse(reset_summary["available"])
+        self.assertEqual(reset_summary["unavailable_reason"], "counter_reset_detected")
+
+    def test_ambiguous_metric_series_is_unavailable(self) -> None:
+        samples = [
+            engine_sample(1.0, ambiguous_prompt=True, generation=1000.0),
+            engine_sample(2.0, ambiguous_prompt=True, generation=1100.0),
+        ]
+        summary = profiler.summarize_engine_token_throughput(samples, t0=0.0, t1=10.0)
+        self.assertFalse(summary["available"])
+        self.assertIn("ambiguous_metric_series", summary["unavailable_reason"])
+
+        generation_ambiguous_samples = [
+            engine_sample(1.0, prompt=1000.0, ambiguous_generation=True),
+            engine_sample(2.0, prompt=1100.0, ambiguous_generation=True),
+        ]
+        generation_summary = profiler.summarize_engine_token_throughput(
+            generation_ambiguous_samples, t0=0.0, t1=10.0
+        )
+        self.assertFalse(generation_summary["available"])
+        self.assertIn(
+            "ambiguous_metric_series", generation_summary["unavailable_reason"]
+        )
+
+    def test_series_identity_change_between_bracket_samples_is_unavailable(
+        self,
+    ) -> None:
+        samples = [
+            engine_sample(
+                1.0, prompt=1000.0, generation=1000.0, prompt_labels={"engine": "0"}
+            ),
+            engine_sample(
+                2.0, prompt=1100.0, generation=1100.0, prompt_labels={"engine": "1"}
+            ),
+        ]
+        summary = profiler.summarize_engine_token_throughput(samples, t0=0.0, t1=10.0)
+        self.assertFalse(summary["available"])
+        self.assertIn("prompt_series_identity_changed", summary["unavailable_reason"])
+
+    def test_samples_outside_window_do_not_leak_in(self) -> None:
+        before_window = [engine_sample(0.5, prompt=1.0, generation=1.0)]
+        in_window = [
+            engine_sample(1.0, prompt=1000.0, generation=1000.0),
+            engine_sample(2.0, prompt=1100.0, generation=1050.0),
+        ]
+        after_window = [engine_sample(20.0, prompt=99999.0, generation=99999.0)]
+        wrong_status = [
+            dict(engine_sample(1.5, prompt=1050.0, generation=1025.0), status="http_error")
+        ]
+        summary = profiler.summarize_engine_token_throughput(
+            before_window + in_window + after_window + wrong_status, t0=1.0, t1=3.0
+        )
+        self.assertTrue(summary["available"])
+        self.assertEqual(summary["telemetry_first_timestamp"], 1.0)
+        self.assertEqual(summary["telemetry_last_timestamp"], 2.0)
+        self.assertEqual(summary["prompt_tokens_delta"], 100.0)
+
+    def test_non_positive_telemetry_duration_is_unavailable(self) -> None:
+        samples = [
+            engine_sample(5.0, prompt=1000.0, generation=1000.0),
+            engine_sample(5.0, prompt=1100.0, generation=1050.0),
+        ]
+        summary = profiler.summarize_engine_token_throughput(samples, t0=0.0, t1=10.0)
+        self.assertFalse(summary["available"])
+        self.assertEqual(
+            summary["unavailable_reason"], "non_positive_telemetry_duration"
+        )
+
+
+class CompletionVsEngineComparisonTests(unittest.TestCase):
+    def test_completion_throughput_differs_from_engine_throughput(self) -> None:
+        summary = {
+            "completed_total_tokens_per_second": 2005.33,
+            "engine_token_throughput": {
+                "available": True,
+                "total_tokens_per_second": 1663.08,
+            },
+        }
+        comparison = profiler.compute_completion_vs_engine_comparison(summary)
+        self.assertTrue(comparison["available"])
+        self.assertAlmostEqual(
+            comparison["completion_vs_engine_ratio"], 2005.33 / 1663.08
+        )
+        expected_percent = (2005.33 - 1663.08) / 1663.08 * 100.0
+        self.assertAlmostEqual(
+            comparison["completion_vs_engine_percent_difference"], expected_percent
+        )
+        self.assertGreater(comparison["completion_vs_engine_percent_difference"], 0)
+
+    def test_unavailable_when_engine_throughput_unavailable(self) -> None:
+        summary = {
+            "completed_total_tokens_per_second": 1234.0,
+            "engine_token_throughput": {"available": False},
+        }
+        comparison = profiler.compute_completion_vs_engine_comparison(summary)
+        self.assertFalse(comparison["available"])
+
+
+class ComputeAdjacentGainUsesEngineThroughputTests(unittest.TestCase):
+    def test_gain_is_computed_from_engine_not_completion_throughput(self) -> None:
+        # Completion throughput is deliberately set to show the OPPOSITE
+        # trend from engine throughput, so a correct implementation (using
+        # engine throughput) and a buggy one (using completion throughput)
+        # produce clearly different, unambiguous signs.
+        previous_summary = {
+            "completed_total_tokens_per_second": 5000.0,
+            "engine_token_throughput": {
+                "available": True,
+                "total_tokens_per_second": 1000.0,
+            },
+        }
+        current_summary = {
+            "completed_total_tokens_per_second": 1000.0,
+            "engine_token_throughput": {
+                "available": True,
+                "total_tokens_per_second": 1100.0,
+            },
+        }
+        gain = profiler.compute_adjacent_gain(previous_summary, current_summary)
+        self.assertAlmostEqual(gain, 0.1)
+        self.assertGreater(gain, 0)
+
+    def test_no_previous_point_returns_none(self) -> None:
+        current_summary = {
+            "engine_token_throughput": {"available": True, "total_tokens_per_second": 1.0}
+        }
+        self.assertIsNone(profiler.compute_adjacent_gain(None, current_summary))
+
+    def test_unavailable_engine_throughput_returns_none(self) -> None:
+        previous_summary = {
+            "engine_token_throughput": {"available": False},
+        }
+        current_summary = {
+            "engine_token_throughput": {"available": True, "total_tokens_per_second": 1.0},
+        }
+        self.assertIsNone(
+            profiler.compute_adjacent_gain(previous_summary, current_summary)
+        )
+        self.assertIsNone(
+            profiler.compute_adjacent_gain(current_summary, previous_summary)
+        )
+
+
+# ---------------------------------------------------------------------------
 # GPU measurement-window telemetry summaries
 # ---------------------------------------------------------------------------
 
@@ -1515,6 +1840,174 @@ class StartupRampTests(unittest.TestCase):
         self.assertTrue(all(not r["in_measurement_window"] for r in results if r["phase"] == "ramp"))
 
 
+class IncrementingMetricsTransport:
+    """A deterministic fake vLLM /metrics endpoint with monotonic counters."""
+
+    def __init__(
+        self, prompt_increment: float = 50.0, generation_increment: float = 30.0
+    ) -> None:
+        self.calls = 0
+        self.prompt_value = 1000.0
+        self.generation_value = 2000.0
+        self.prompt_increment = prompt_increment
+        self.generation_increment = generation_increment
+
+    def __call__(self, endpoint: str, timeout: float) -> smoke.HttpResponse:
+        self.calls += 1
+        self.prompt_value += self.prompt_increment
+        self.generation_value += self.generation_increment
+        body = (
+            f"vllm:prompt_tokens_total {self.prompt_value}\n"
+            f"vllm:generation_tokens_total {self.generation_value}\n"
+            f"vllm:num_requests_running 1\n"
+        ).encode("utf-8")
+        return smoke.HttpResponse(200, body)
+
+
+class RunLoadPointEngineThroughputIntegrationTests(unittest.TestCase):
+    """End-to-end proof that run_load_point wires the primary estimator in,
+    without disturbing the (unchanged) startup-ramp or [T0,T1) mechanics."""
+
+    def setUp(self) -> None:
+        all_records = make_records(64)
+        self.bucket = generator.DEFAULT_BUCKETS[2]  # "output-heavy"
+        self.records = profiler.select_bucket_records(all_records, self.bucket.name)
+        self.cycle = profiler.PromptCycle(self.records)
+        self.endpoint = "http://127.0.0.1:8000/v1/completions"
+
+    def test_engine_throughput_is_available_and_can_make_a_point_valid(self) -> None:
+        transport = DelayedTransport(delay_seconds=0.01)
+        metrics_transport = IncrementingMetricsTransport()
+        timing = profiler.TimingConfig(
+            settling_seconds=0.05,
+            measurement_seconds=0.2,
+            drain_timeout_seconds=2.0,
+            metrics_interval_seconds=0.02,
+            request_timeout_seconds=5.0,
+            ramp_admission_interval_seconds=0.02,
+        )
+        telemetry_config = profiler.TelemetryConfig(
+            metrics_endpoint="http://x/metrics",
+            metrics_transport=metrics_transport,
+            gpu_sampler=lambda: {"available": False, "error": "no gpu in tests"},
+            interval_seconds=timing.metrics_interval_seconds,
+            request_timeout_seconds=5.0,
+        )
+        summary, results = profiler.run_load_point(
+            concurrency=4,
+            cycle=self.cycle,
+            endpoint=self.endpoint,
+            model=MODEL,
+            bucket=self.bucket,
+            timing=timing,
+            transport=transport,
+            idle_check=always_ok_idle_check,
+            telemetry_config=telemetry_config,
+            run_id="engine-throughput-test",
+        )
+        engine = summary["engine_token_throughput"]
+        self.assertTrue(engine["available"], msg=engine.get("unavailable_reason"))
+        self.assertGreater(engine["total_tokens_per_second"], 0)
+        self.assertEqual(
+            engine["prompt_tokens_delta"] + engine["generation_tokens_delta"],
+            engine["total_tokens_delta"],
+        )
+        self.assertTrue(summary["run_valid"], msg=summary["invalidation_reasons"])
+        # Startup-ramp mechanics remain exactly as before: full concurrency
+        # is reached before settling, and T0 is exactly settling_start +
+        # settling_seconds.
+        ramp = summary["startup_ramp"]
+        self.assertEqual(
+            ramp["target_concurrency_reached_s"], summary["settling_start_s"]
+        )
+        self.assertAlmostEqual(
+            summary["measurement_t0_s"],
+            summary["settling_start_s"] + timing.settling_seconds,
+            places=9,
+        )
+        # Secondary completion diagnostic and comparison are both present.
+        self.assertIn("completion_throughput_role", summary)
+        self.assertTrue(summary["completion_vs_engine"]["available"])
+        # Completion clustering remains a diagnostic, independent of the
+        # engine estimator's availability/validity.
+        self.assertIn("completion_clustering", summary)
+        self.assertIn("phase_synchronization_suspected", summary["completion_clustering"])
+
+    def test_missing_engine_counters_invalidates_point_even_if_otherwise_healthy(
+        self,
+    ) -> None:
+        transport = DelayedTransport(delay_seconds=0.01)
+
+        def metrics_transport_without_counters(endpoint, timeout):
+            return smoke.HttpResponse(200, b"vllm:num_requests_running 1\n")
+
+        timing = profiler.TimingConfig(
+            settling_seconds=0.02,
+            measurement_seconds=0.05,
+            drain_timeout_seconds=2.0,
+            metrics_interval_seconds=0.02,
+            request_timeout_seconds=5.0,
+        )
+        telemetry_config = profiler.TelemetryConfig(
+            metrics_endpoint="http://x/metrics",
+            metrics_transport=metrics_transport_without_counters,
+            gpu_sampler=lambda: {"available": False, "error": "no gpu"},
+            interval_seconds=timing.metrics_interval_seconds,
+            request_timeout_seconds=5.0,
+        )
+        summary, _ = profiler.run_load_point(
+            concurrency=2,
+            cycle=self.cycle,
+            endpoint=self.endpoint,
+            model=MODEL,
+            bucket=self.bucket,
+            timing=timing,
+            transport=transport,
+            idle_check=always_ok_idle_check,
+            telemetry_config=telemetry_config,
+            run_id="engine-throughput-test",
+        )
+        self.assertFalse(summary["engine_token_throughput"]["available"])
+        self.assertFalse(summary["run_valid"])
+        self.assertTrue(
+            any(
+                reason.startswith("engine_token_throughput_unavailable")
+                for reason in summary["invalidation_reasons"]
+            )
+        )
+        # Not silently falling back: the secondary diagnostic is still
+        # computed and present, but does not rescue run_valid.
+        self.assertIsInstance(summary["completed_total_tokens_per_second"], float)
+
+    def test_no_telemetry_config_invalidates_point(self) -> None:
+        transport = DelayedTransport(delay_seconds=0.01)
+        timing = profiler.TimingConfig(
+            settling_seconds=0.02,
+            measurement_seconds=0.03,
+            drain_timeout_seconds=2.0,
+            metrics_interval_seconds=1.0,
+            request_timeout_seconds=5.0,
+        )
+        summary, _ = profiler.run_load_point(
+            concurrency=2,
+            cycle=self.cycle,
+            endpoint=self.endpoint,
+            model=MODEL,
+            bucket=self.bucket,
+            timing=timing,
+            transport=transport,
+            idle_check=always_ok_idle_check,
+            telemetry_config=None,
+            run_id="engine-throughput-test",
+        )
+        self.assertFalse(summary["engine_token_throughput"]["available"])
+        self.assertEqual(
+            summary["engine_token_throughput"]["unavailable_reason"],
+            "telemetry_not_collected",
+        )
+        self.assertFalse(summary["run_valid"])
+
+
 # ---------------------------------------------------------------------------
 # Fail-closed precondition behavior (real Colab defect regression coverage)
 #
@@ -1592,6 +2085,13 @@ class FailedPreconditionFailsClosedTests(unittest.TestCase):
         self.assertTrue(summary["execution_skipped"])
         self.assertEqual(
             summary["execution_skipped_reason"], "precondition_failed:Connection refused"
+        )
+        # The primary engine estimator is explicitly unavailable too (not
+        # merely absent), and does not itself get a chance to run.
+        self.assertFalse(summary["engine_token_throughput"]["available"])
+        self.assertEqual(
+            summary["engine_token_throughput"]["unavailable_reason"],
+            "execution_skipped_precondition_failed",
         )
 
     def test_no_settling_or_measurement_execution_occurs(self) -> None:
@@ -1750,9 +2250,10 @@ class ManifestTests(unittest.TestCase):
         self.assertIn("Declared by the operator", note)
 
     def test_manifest_records_selected_bucket_and_validation_status(self) -> None:
-        # output-heavy remains the not-yet-validated bucket (the suspected
-        # phase-synchronization artifact is unresolved on real hardware);
-        # balanced and input-heavy are both now validated.
+        # output-heavy remains under human validation (the suspected
+        # phase-synchronization artifact was ruled out after ramping, but
+        # the engine-vs-completion evidence and one anomalous point still
+        # require human review); balanced and input-heavy are validated.
         config = self._build_config(bucket="output-heavy", run_id="r1")
         manifest = profiler.build_manifest(
             config,
@@ -1762,19 +2263,23 @@ class ManifestTests(unittest.TestCase):
             server_identity={"vllm_version": None, "gpu_fingerprint": {"available": False}},
         )
         self.assertEqual(manifest["dataset"]["bucket_definition"]["name"], "output-heavy")
-        self.assertIn("NOT YET VALIDATED", manifest["bucket_validation_status"])
+        self.assertIn(
+            "UNDER HUMAN VALIDATION", manifest["bucket_validation_status"]
+        )
+        self.assertIn("primary_capacity_estimator", manifest)
+        self.assertTrue(manifest["primary_capacity_estimator"]["mandatory"])
 
     def test_input_heavy_and_balanced_are_validated(self) -> None:
         self.assertIn("VALIDATED", profiler.BUCKET_VALIDATION_STATUS["balanced"])
         self.assertNotIn(
-            "NOT YET VALIDATED", profiler.BUCKET_VALIDATION_STATUS["balanced"]
+            "UNDER HUMAN VALIDATION", profiler.BUCKET_VALIDATION_STATUS["balanced"]
         )
         self.assertIn("VALIDATED", profiler.BUCKET_VALIDATION_STATUS["input-heavy"])
         self.assertNotIn(
-            "NOT YET VALIDATED", profiler.BUCKET_VALIDATION_STATUS["input-heavy"]
+            "UNDER HUMAN VALIDATION", profiler.BUCKET_VALIDATION_STATUS["input-heavy"]
         )
         self.assertIn(
-            "NOT YET VALIDATED", profiler.BUCKET_VALIDATION_STATUS["output-heavy"]
+            "UNDER HUMAN VALIDATION", profiler.BUCKET_VALIDATION_STATUS["output-heavy"]
         )
 
     def test_config_validation_rejects_bad_gpu_memory_utilization(self) -> None:

@@ -18,6 +18,11 @@ real Colab Tesla T4 hardware: fixed closed-loop concurrency, explicit
 settling/measurement/drain phases, half-open ``[T0, T1)`` terminal-window
 accounting, and the same raw-token ``/v1/completions`` request contract.
 
+The PRIMARY capacity estimator is ``engine_token_throughput`` (derived from
+vLLM's own ``vllm:prompt_tokens_total``/``vllm:generation_tokens_total``
+counter deltas), not terminal-completion accounting -- see
+``summarize_engine_token_throughput`` and D1/D2 below.
+
 As of this implementation:
 
 * the ``balanced`` bucket has been VALIDATED on real Tesla T4 hardware
@@ -25,16 +30,18 @@ As of this implementation:
   ``V_M^(balanced) ~= 1274 logical token/s``;
 * the ``input-heavy`` bucket has also been VALIDATED on independent real
   Tesla T4 runs: ``V_M^(input-heavy) ~= 1820 logical token/s``;
-* the ``output-heavy`` bucket is NOT YET VALIDATED. Real-runtime profiling
-  exposed a suspected initial-admission phase-synchronization /
-  completion-wave-aliasing artifact (near-exact multiples of the target
-  concurrency completing together, producing an apparently non-monotonic
-  throughput curve at several concurrency points despite zero failures,
-  zero preemptions, and bounded drains). See the completion-clustering
-  diagnostic (``summarize_completion_clustering``) and the deterministic
-  startup-ramp mechanism (``TimingConfig.ramp_admission_interval_seconds``)
-  added to investigate and mitigate this before drawing any output-heavy
-  capacity conclusion.
+* the ``output-heavy`` bucket is UNDER HUMAN VALIDATION (not yet accepted).
+  Ramped real-runtime re-profiling WAS performed; the non-chaining
+  completion-burst diagnostic found NO near-concurrency completion-wave
+  synchronization after ramping, ruling out startup phase-synchronization
+  as the main explanation. The terminal-completion estimator nonetheless
+  remained materially boundary-sensitive for this long-output bucket
+  (roughly -11% to +9% vs. engine counters), which is why engine-counter
+  throughput is now the PRIMARY estimator for every bucket. Real evidence
+  up to C=288 suggests output-heavy throughput is approaching its maximum
+  region, but one point (C=160) showed an unexplained local dip requiring
+  a clean repeat; see ``BUCKET_VALIDATION_STATUS["output-heavy"]`` for the
+  full evidence summary. No output-heavy V_M value is accepted.
 
 It intentionally reuses the already-accepted dataset and request-contract
 layers instead of duplicating them:
@@ -150,16 +157,30 @@ BUCKET_VALIDATION_STATUS: dict[str, str] = {
         "V_M^(input-heavy) ~= 1820 logical token/s."
     ),
     "output-heavy": (
-        "NOT YET VALIDATED. Real-runtime profiling exposed a suspected "
-        "initial-admission phase-synchronization / completion-wave "
-        "aliasing artifact: several concurrency points completed near-"
-        "exact multiples of the target concurrency (e.g. completed = "
-        "2*C), producing an apparently non-monotonic throughput curve "
-        "despite zero request failures, zero preemptions, and bounded "
-        "drains. See the completion_clustering diagnostic in each point "
-        "summary and the startup_ramp mechanism before drawing any "
-        "output-heavy capacity conclusion; re-profiling on real hardware "
-        "with ramping enabled has not yet been performed."
+        "UNDER HUMAN VALIDATION (not yet accepted). A deterministic "
+        "startup ramp was added and ramped real-runtime re-profiling WAS "
+        "performed on real Tesla T4 hardware. The non-chaining fixed-"
+        "width completion-burst diagnostic found NO near-concurrency "
+        "completion-wave synchronization after ramping was enabled, "
+        "ruling out initial-admission phase synchronization as the main "
+        "explanation. However, the terminal-completion throughput "
+        "estimator (completed_total_tokens_per_second) remained "
+        "materially boundary-sensitive for this long-output bucket "
+        "(differences of roughly -11% to +9% against engine-side vLLM "
+        "counters across concurrency points). Engine-side counter "
+        "throughput (engine_token_throughput.total_tokens_per_second, "
+        "derived from vllm:prompt_tokens_total + "
+        "vllm:generation_tokens_total deltas) is now the PRIMARY capacity "
+        "estimator for every bucket, precisely because of this evidence. "
+        "Real-runtime evidence up to C=288 suggests output-heavy engine "
+        "throughput is approaching its maximum region (a persistent "
+        "running-request ceiling and growing waiting population appear "
+        "at high offered concurrency), but one concurrency point (C=160) "
+        "showed an unexplained local engine-throughput dip that requires "
+        "a clean repeat, and NO final V_M(output-heavy) value is "
+        "accepted. Do not treat any output-heavy capacity number as "
+        "validated until that repeat and a human plateau review are "
+        "complete."
     ),
 }
 
@@ -403,6 +424,15 @@ VLLM_KV_CACHE_METRIC_CANDIDATES: tuple[str, ...] = (
     "vllm:gpu_cache_usage_perc",
 )
 VLLM_PREEMPTIONS_METRIC_CANDIDATES: tuple[str, ...] = ("vllm:num_preemptions_total",)
+# Primary V_M engine-side counters (#1546 real-runtime evidence: terminal-
+# completion throughput is boundary-sensitive for long-output buckets; see
+# summarize_engine_token_throughput below). Single-candidate on purpose:
+# unlike the gauges above, these are monotonic counters used for a strict,
+# fail-closed delta computation, not a best-effort fallback list.
+VLLM_PROMPT_TOKENS_METRIC_CANDIDATES: tuple[str, ...] = ("vllm:prompt_tokens_total",)
+VLLM_GENERATION_TOKENS_METRIC_CANDIDATES: tuple[str, ...] = (
+    "vllm:generation_tokens_total",
+)
 
 
 def parse_prometheus_text(text: str) -> list[dict[str, Any]]:
@@ -515,6 +545,324 @@ def summarize_vllm_telemetry_window(
         "num_requests_waiting": _avg_max(waiting),
         "kv_cache_usage_perc": _avg_max(kv_cache),
         "num_preemptions_total": preemption_summary,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Primary V_M estimator: engine-side token-counter throughput
+#
+# Real output-heavy profiling showed the terminal-completion estimator
+# (completed_total_tokens_per_second, based on assigning a request's full
+# W=L_in+L_out work to its terminal timestamp) differs materially -- roughly
+# -11% to +9% in observed evidence -- from vLLM's own engine-side counters
+# (vllm:prompt_tokens_total, vllm:generation_tokens_total), which increase
+# as work is actually processed and do not require a request to terminate
+# inside [T0,T1). This is expected for long-output buckets: a request whose
+# generation spans a [T0,T1) boundary contributes engine-side work smoothly
+# throughout the window, but terminal-completion accounting assigns either
+# ALL or NONE of its total tokens depending purely on which side of T1 (or
+# T0) its single terminal timestamp happens to fall. Engine-counter
+# throughput is therefore adopted as the PRIMARY capacity estimator; the
+# terminal-completion estimator is retained as a secondary, boundary-
+# sensitive diagnostic (see summarize_point's completed_* fields and
+# compute_completion_vs_engine_comparison below), never silently used as a
+# fallback when the engine estimator is unavailable.
+# ---------------------------------------------------------------------------
+
+
+def _select_counter_sample(
+    sample: Mapping[str, Any], metric_names: Sequence[str]
+) -> tuple[float | None, dict[str, str] | None, str | None, str | None]:
+    """Deterministically select exactly one counter value from one telemetry
+    snapshot, or fail closed.
+
+    Returns ``(value, labels, matched_metric_name, error_reason)``.
+
+    Candidate names are tried in order (first PRESENT name wins, consistent
+    with this module's other metric-name fallback lists), but a candidate
+    resolving to more than one distinct sample within one telemetry
+    snapshot (e.g. more than one label combination, such as multiple
+    engines/models/TP ranks) is deliberately treated as an ambiguity error
+    rather than summed or guessed. This profiler's current experiment is
+    exactly one engine, one model, and one TP rank, so a counter resolving
+    to more than one series is unexpected and must invalidate the estimator
+    rather than silently aggregate unrelated series.
+    """
+
+    known = sample.get("known_metrics") or {}
+    for name in metric_names:
+        entry = known.get(name)
+        if not entry or not entry.get("present"):
+            continue
+        matching_samples = entry.get("samples") or []
+        if len(matching_samples) > 1:
+            return None, None, name, f"ambiguous_metric_series:{name}"
+        if len(matching_samples) == 1:
+            matched = matching_samples[0]
+            return (
+                matched["value"],
+                dict(matched.get("labels") or {}),
+                name,
+                None,
+            )
+    return None, None, None, None
+
+
+def _empty_engine_token_throughput(
+    *,
+    available: bool,
+    unavailable_reason: str | None,
+    measurement_sample_count: int = 0,
+    telemetry_first_timestamp: float | None = None,
+    telemetry_last_timestamp: float | None = None,
+) -> dict[str, Any]:
+    """A schema-complete engine-throughput record with every quantity absent.
+
+    Every key defined by a successful computation is always present here
+    too (as ``None``), so callers never need to branch on which keys exist
+    -- only on ``available``.
+    """
+
+    return {
+        "available": available,
+        "unavailable_reason": unavailable_reason,
+        "measurement_sample_count": measurement_sample_count,
+        "telemetry_first_timestamp": telemetry_first_timestamp,
+        "telemetry_last_timestamp": telemetry_last_timestamp,
+        "telemetry_duration_s": None,
+        "prompt_tokens_start": None,
+        "prompt_tokens_end": None,
+        "prompt_tokens_delta": None,
+        "generation_tokens_start": None,
+        "generation_tokens_end": None,
+        "generation_tokens_delta": None,
+        "total_tokens_delta": None,
+        "prompt_tokens_per_second": None,
+        "generation_tokens_per_second": None,
+        "total_tokens_per_second": None,
+        "selected_series": {
+            "prompt_tokens_total": None,
+            "generation_tokens_total": None,
+        },
+    }
+
+
+def summarize_engine_token_throughput(
+    samples: Sequence[Mapping[str, Any]], t0: float, t1: float
+) -> dict[str, Any]:
+    """Primary V_M capacity evidence: engine-side counter deltas in [t0, t1).
+
+    Uses ONLY ``status == "ok"`` telemetry samples whose ``timestamp``
+    satisfies ``t0 <= timestamp < t1`` (defense against another point's/
+    window's samples leaking in, exactly like the other telemetry
+    summaries). Uses the FIRST and LAST such valid samples as the bracket.
+    The actual ``telemetry_first_timestamp``/``telemetry_last_timestamp``/
+    ``telemetry_duration_s`` are always recorded explicitly and are never
+    assumed to coincide with T0/T1 or with ``measurement_seconds``; this
+    denominator is derived strictly from the telemetry evidence that
+    happens to fall inside the window, not the nominal configured duration.
+
+    Fails closed (``available=False`` with an explicit
+    ``unavailable_reason``) rather than silently substituting a fallback
+    value, if:
+
+    * fewer than two valid in-window telemetry samples exist;
+    * the prompt or generation counter is not present in either bracket
+      sample, or resolves ambiguously to more than one series;
+    * the selected series' labels differ between the first and last
+      sample (the identity of "the" counter must be stable across the
+      window for a valid delta);
+    * either counter's last value is less than its first value (a counter
+      reset/restart -- never wrapped or absolute-valued);
+    * the resulting telemetry duration is non-positive or non-finite.
+    """
+
+    window_samples = sorted(
+        (
+            sample
+            for sample in samples
+            if sample.get("status") == "ok"
+            and sample.get("timestamp") is not None
+            and t0 <= sample["timestamp"] < t1
+        ),
+        key=lambda sample: sample["timestamp"],
+    )
+
+    if len(window_samples) < 2:
+        return _empty_engine_token_throughput(
+            available=False,
+            unavailable_reason="fewer_than_two_valid_telemetry_samples_in_window",
+            measurement_sample_count=len(window_samples),
+            telemetry_first_timestamp=(
+                window_samples[0]["timestamp"] if window_samples else None
+            ),
+            telemetry_last_timestamp=(
+                window_samples[-1]["timestamp"] if window_samples else None
+            ),
+        )
+
+    first_sample = window_samples[0]
+    last_sample = window_samples[-1]
+
+    (
+        prompt_start,
+        prompt_start_labels,
+        prompt_start_name,
+        prompt_start_error,
+    ) = _select_counter_sample(first_sample, VLLM_PROMPT_TOKENS_METRIC_CANDIDATES)
+    (
+        prompt_end,
+        prompt_end_labels,
+        prompt_end_name,
+        prompt_end_error,
+    ) = _select_counter_sample(last_sample, VLLM_PROMPT_TOKENS_METRIC_CANDIDATES)
+    (
+        generation_start,
+        generation_start_labels,
+        generation_start_name,
+        generation_start_error,
+    ) = _select_counter_sample(first_sample, VLLM_GENERATION_TOKENS_METRIC_CANDIDATES)
+    (
+        generation_end,
+        generation_end_labels,
+        generation_end_name,
+        generation_end_error,
+    ) = _select_counter_sample(last_sample, VLLM_GENERATION_TOKENS_METRIC_CANDIDATES)
+
+    reasons: list[str] = [
+        error
+        for error in (
+            prompt_start_error,
+            prompt_end_error,
+            generation_start_error,
+            generation_end_error,
+        )
+        if error is not None
+    ]
+    if prompt_start is None or prompt_end is None:
+        reasons.append("prompt_tokens_total_unavailable")
+    if generation_start is None or generation_end is None:
+        reasons.append("generation_tokens_total_unavailable")
+
+    if reasons:
+        return _empty_engine_token_throughput(
+            available=False,
+            unavailable_reason=";".join(sorted(set(reasons))),
+            measurement_sample_count=len(window_samples),
+            telemetry_first_timestamp=first_sample["timestamp"],
+            telemetry_last_timestamp=last_sample["timestamp"],
+        )
+
+    if prompt_start_labels != prompt_end_labels:
+        reasons.append("prompt_series_identity_changed")
+    if generation_start_labels != generation_end_labels:
+        reasons.append("generation_series_identity_changed")
+    if reasons:
+        return _empty_engine_token_throughput(
+            available=False,
+            unavailable_reason=";".join(sorted(set(reasons))),
+            measurement_sample_count=len(window_samples),
+            telemetry_first_timestamp=first_sample["timestamp"],
+            telemetry_last_timestamp=last_sample["timestamp"],
+        )
+
+    if prompt_end < prompt_start or generation_end < generation_start:
+        return _empty_engine_token_throughput(
+            available=False,
+            unavailable_reason="counter_reset_detected",
+            measurement_sample_count=len(window_samples),
+            telemetry_first_timestamp=first_sample["timestamp"],
+            telemetry_last_timestamp=last_sample["timestamp"],
+        )
+
+    telemetry_duration = last_sample["timestamp"] - first_sample["timestamp"]
+    if not math.isfinite(telemetry_duration) or telemetry_duration <= 0:
+        return _empty_engine_token_throughput(
+            available=False,
+            unavailable_reason="non_positive_telemetry_duration",
+            measurement_sample_count=len(window_samples),
+            telemetry_first_timestamp=first_sample["timestamp"],
+            telemetry_last_timestamp=last_sample["timestamp"],
+        )
+
+    prompt_delta = prompt_end - prompt_start
+    generation_delta = generation_end - generation_start
+    total_delta = prompt_delta + generation_delta
+
+    return {
+        "available": True,
+        "unavailable_reason": None,
+        "measurement_sample_count": len(window_samples),
+        "telemetry_first_timestamp": first_sample["timestamp"],
+        "telemetry_last_timestamp": last_sample["timestamp"],
+        "telemetry_duration_s": telemetry_duration,
+        "prompt_tokens_start": prompt_start,
+        "prompt_tokens_end": prompt_end,
+        "prompt_tokens_delta": prompt_delta,
+        "generation_tokens_start": generation_start,
+        "generation_tokens_end": generation_end,
+        "generation_tokens_delta": generation_delta,
+        "total_tokens_delta": total_delta,
+        "prompt_tokens_per_second": prompt_delta / telemetry_duration,
+        "generation_tokens_per_second": generation_delta / telemetry_duration,
+        "total_tokens_per_second": total_delta / telemetry_duration,
+        "selected_series": {
+            "prompt_tokens_total": {
+                "metric_name": prompt_end_name,
+                "labels": prompt_end_labels,
+            },
+            "generation_tokens_total": {
+                "metric_name": generation_end_name,
+                "labels": generation_end_labels,
+            },
+        },
+    }
+
+
+def compute_completion_vs_engine_comparison(
+    summary: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Diagnostic-only comparison of the secondary and primary estimators.
+
+    Terminal-completion throughput assigns a request's FULL total-token
+    work according to its single terminal timestamp, while engine counters
+    attribute work to when it was actually processed during the
+    measurement window; for long-output workloads whose generation spans a
+    [T0,T1) boundary, these can differ materially. This never influences
+    ``run_valid`` or ``adjacent_throughput_gain``; it is purely descriptive
+    evidence for human review of estimator quality.
+    """
+
+    engine = summary.get("engine_token_throughput") or {}
+    engine_rate = engine.get("total_tokens_per_second")
+    completion_rate = summary.get("completed_total_tokens_per_second")
+
+    if not engine.get("available") or not engine_rate:
+        return {
+            "available": False,
+            "unavailable_reason": (
+                "engine_token_throughput_unavailable"
+                if not engine.get("available")
+                else "engine_total_tokens_per_second_is_zero"
+            ),
+        }
+
+    return {
+        "available": True,
+        "unavailable_reason": None,
+        "completion_total_tokens_per_second": completion_rate,
+        "engine_total_tokens_per_second": engine_rate,
+        "completion_vs_engine_ratio": completion_rate / engine_rate,
+        "completion_vs_engine_percent_difference": (
+            (completion_rate - engine_rate) / engine_rate * 100.0
+        ),
+        "note": (
+            "Terminal completion throughput assigns a request's full "
+            "total-token work according to its terminal timestamp, while "
+            "engine counters represent work processed during the "
+            "measurement window. Engine throughput is the PRIMARY V_M "
+            "estimator; this comparison is diagnostic evidence only."
+        ),
     }
 
 
@@ -1187,6 +1535,11 @@ def summarize_point(
         "completed_requests_in_window": completed_requests,
         "completed_requests_per_second": completed_request_rate,
         "completed_total_tokens_per_second": completed_total_token_rate,
+        "completion_throughput_role": (
+            "secondary_boundary_sensitive_completion_diagnostic; NOT the "
+            "primary capacity estimator and NOT the basis for "
+            "adjacent_throughput_gain -- see engine_token_throughput"
+        ),
         "outstanding_at_t1": outstanding_at_t1,
         "outstanding_after_drain": outstanding_after_drain,
         "drain_duration_s": drain_duration,
@@ -1214,7 +1567,10 @@ def summarize_point(
         "capacity_quantity_warning": (
             "This is monolithic non-P/D V_M evidence using L_in+L_out total "
             "tokens; it is not physical KV-release throughput, not isolated "
-            "decoder V_D, and not a final plateau determination."
+            "decoder V_D, and not a final plateau determination. The "
+            "PRIMARY capacity quantity is engine_token_throughput."
+            "total_tokens_per_second; completed_total_tokens_per_second "
+            "above is a secondary, boundary-sensitive diagnostic only."
         ),
     }
 
@@ -1223,14 +1579,27 @@ def compute_adjacent_gain(
     previous_valid_summary: Mapping[str, Any] | None,
     current_summary: Mapping[str, Any],
 ) -> float | None:
-    """Relative throughput gain vs. the prior VALID point, when applicable (D16)."""
+    """Relative ENGINE total-token throughput gain vs. the prior VALID point.
+
+    Uses ``engine_token_throughput.total_tokens_per_second`` -- the PRIMARY
+    V_M estimator -- never the secondary terminal-completion estimator, per
+    the #1546 real-runtime evidence that terminal-completion throughput is
+    boundary-sensitive for long-output buckets (D16). Since a point without
+    an available engine estimator is never valid (see run_load_point), a
+    ``previous_valid_summary`` always has ``engine_token_throughput``
+    available in practice; the availability checks below are defensive.
+    """
 
     if previous_valid_summary is None:
         return None
-    previous_rate = previous_valid_summary["completed_total_tokens_per_second"]
+    previous_engine = previous_valid_summary.get("engine_token_throughput") or {}
+    current_engine = current_summary.get("engine_token_throughput") or {}
+    if not previous_engine.get("available") or not current_engine.get("available"):
+        return None
+    previous_rate = previous_engine.get("total_tokens_per_second")
+    current_rate = current_engine.get("total_tokens_per_second")
     if not previous_rate:
         return None
-    current_rate = current_summary["completed_total_tokens_per_second"]
     return (current_rate - previous_rate) / previous_rate
 
 
@@ -1338,6 +1707,10 @@ def run_load_point(
         skip_t_start = clock()
         skip_t0 = skip_t_start + timing.settling_seconds
         skip_t1 = skip_t0 + timing.measurement_seconds
+        extra_invalidation_reasons.append(
+            "engine_token_throughput_unavailable:"
+            "execution_skipped_precondition_failed"
+        )
         summary = summarize_point(
             bucket=bucket,
             concurrency=concurrency,
@@ -1368,6 +1741,20 @@ def run_load_point(
         summary["gpu_telemetry"] = {
             "available": False,
             "reason": "execution_skipped_precondition_failed",
+        }
+        summary["engine_token_throughput"] = _empty_engine_token_throughput(
+            available=False,
+            unavailable_reason="execution_skipped_precondition_failed",
+        )
+        summary["completion_vs_engine"] = {
+            "available": False,
+            "unavailable_reason": "execution_skipped_precondition_failed",
+        }
+        summary["saturation_ceiling_evidence"] = {
+            "concurrency_target": concurrency,
+            "max_observed_running": None,
+            "max_observed_waiting": None,
+            "note": "execution_skipped_precondition_failed: no telemetry was collected",
         }
         summary["completion_clustering"] = summarize_completion_clustering(
             results=[],
@@ -1554,6 +1941,44 @@ def run_load_point(
             for result in results
         ]
 
+    # Telemetry summaries (including the PRIMARY engine-throughput
+    # estimator) are computed BEFORE summarize_point() so that an
+    # unavailable engine estimator can be folded into
+    # extra_invalidation_reasons -- engine-counter throughput is mandatory
+    # for a valid capacity point (#1546); it is never silently replaced by
+    # the secondary terminal-completion estimator.
+    if telemetry_config is not None:
+        with local_telemetry_lock:
+            vllm_samples_snapshot = list(local_vllm_samples)
+            gpu_samples_snapshot = list(local_gpu_samples)
+        vllm_telemetry_summary = summarize_vllm_telemetry_window(
+            vllm_samples_snapshot, t0, t1
+        )
+        gpu_telemetry_summary = summarize_gpu_telemetry_window(
+            gpu_samples_snapshot, t0, t1
+        )
+        engine_token_throughput = summarize_engine_token_throughput(
+            vllm_samples_snapshot, t0, t1
+        )
+    else:
+        vllm_telemetry_summary = {
+            "available": False,
+            "reason": "telemetry_not_collected",
+        }
+        gpu_telemetry_summary = {
+            "available": False,
+            "reason": "telemetry_not_collected",
+        }
+        engine_token_throughput = _empty_engine_token_throughput(
+            available=False, unavailable_reason="telemetry_not_collected"
+        )
+
+    if not engine_token_throughput["available"]:
+        extra_invalidation_reasons.append(
+            "engine_token_throughput_unavailable:"
+            f"{engine_token_throughput['unavailable_reason']}"
+        )
+
     summary = summarize_point(
         bucket=bucket,
         concurrency=concurrency,
@@ -1584,26 +2009,32 @@ def run_load_point(
             timing.near_concurrency_burst_threshold_fraction
         ),
     )
-
-    if telemetry_config is not None:
-        with local_telemetry_lock:
-            vllm_samples_snapshot = list(local_vllm_samples)
-            gpu_samples_snapshot = list(local_gpu_samples)
-        summary["vllm_telemetry"] = summarize_vllm_telemetry_window(
-            vllm_samples_snapshot, t0, t1
-        )
-        summary["gpu_telemetry"] = summarize_gpu_telemetry_window(
-            gpu_samples_snapshot, t0, t1
-        )
-    else:
-        summary["vllm_telemetry"] = {
-            "available": False,
-            "reason": "telemetry_not_collected",
-        }
-        summary["gpu_telemetry"] = {
-            "available": False,
-            "reason": "telemetry_not_collected",
-        }
+    summary["vllm_telemetry"] = vllm_telemetry_summary
+    summary["gpu_telemetry"] = gpu_telemetry_summary
+    summary["engine_token_throughput"] = engine_token_throughput
+    summary["completion_vs_engine"] = compute_completion_vs_engine_comparison(summary)
+    summary["saturation_ceiling_evidence"] = {
+        "concurrency_target": concurrency,
+        "max_observed_running": (
+            vllm_telemetry_summary["num_requests_running"]["max"]
+            if vllm_telemetry_summary.get("num_requests_running", {}).get("available")
+            else None
+        ),
+        "max_observed_waiting": (
+            vllm_telemetry_summary["num_requests_waiting"]["max"]
+            if vllm_telemetry_summary.get("num_requests_waiting", {}).get("available")
+            else None
+        ),
+        "note": (
+            "A persistent running-request ceiling below concurrency_target, "
+            "together with a nonzero waiting population, is evidence the "
+            "server (not the client) is limiting concurrency (e.g. a "
+            "max_num_seqs-style engine/config limit): saturation/config-"
+            "limit evidence for HUMAN REVIEW. This does NOT automatically "
+            "infer a universal ceiling value or declare a plateau; it is "
+            "purely descriptive per-point evidence."
+        ),
+    }
 
     return summary, results_snapshot
 
@@ -1843,6 +2274,38 @@ def build_manifest(
                 "never selects or rejects a plateau; see README."
             ),
         },
+        "primary_capacity_estimator": {
+            "name": "engine_token_throughput.total_tokens_per_second",
+            "formula": (
+                "(delta(vllm:prompt_tokens_total) + "
+                "delta(vllm:generation_tokens_total)) / telemetry_duration_s, "
+                "using the first and last valid ('status'=='ok') vLLM "
+                "/metrics samples with timestamp in [T0,T1)"
+            ),
+            "mandatory": True,
+            "note": (
+                "Adopted as the PRIMARY V_M estimator after real-runtime "
+                "evidence showed the secondary terminal-completion "
+                "estimator (completed_total_tokens_per_second) is "
+                "materially boundary-sensitive for long-output buckets. "
+                "Engine-counter throughput is mandatory for a valid "
+                "capacity point: if it is unavailable (missing counters, "
+                "fewer than two valid in-window telemetry samples, an "
+                "ambiguous/unstable metric series, or a counter reset), the "
+                "point is marked invalid via "
+                "'engine_token_throughput_unavailable:<reason>' rather than "
+                "silently falling back to completion throughput. "
+                "adjacent_throughput_gain is computed from this estimator, "
+                "never from completed_total_tokens_per_second."
+            ),
+            "secondary_diagnostic": (
+                "completed_total_tokens_per_second (terminal-completion "
+                "based) is retained per point as a secondary, boundary-"
+                "sensitive diagnostic; see each point summary's "
+                "completion_vs_engine block for the ratio/percent "
+                "difference against the primary estimator."
+            ),
+        },
         "base_url": config.base_url,
         "runtime_launch_assumptions": {
             "note": (
@@ -1952,11 +2415,46 @@ def run_experiment(config: ExperimentConfig) -> dict[str, Any]:
         {
             "bucket": summary["bucket"],
             "concurrency": summary["concurrency_target"],
-            "completed_requests_per_second": summary["completed_requests_per_second"],
-            "completed_total_tokens_per_second": summary[
+            # PRIMARY estimator (engine-side vLLM counters; see
+            # engine_token_throughput and build_manifest's
+            # primary_capacity_estimator for the exact formula).
+            "engine_prompt_tokens_per_second": (
+                summary["engine_token_throughput"]["prompt_tokens_per_second"]
+                if summary["engine_token_throughput"]["available"]
+                else None
+            ),
+            "engine_generation_tokens_per_second": (
+                summary["engine_token_throughput"]["generation_tokens_per_second"]
+                if summary["engine_token_throughput"]["available"]
+                else None
+            ),
+            "engine_total_tokens_per_second": (
+                summary["engine_token_throughput"]["total_tokens_per_second"]
+                if summary["engine_token_throughput"]["available"]
+                else None
+            ),
+            "adjacent_throughput_gain": summary["adjacent_throughput_gain"],
+            # SECONDARY, boundary-sensitive diagnostic only -- NOT the
+            # primary capacity quantity; do not confuse with the engine_*
+            # columns above. See completion_vs_engine below and
+            # summary["completion_throughput_role"].
+            "secondary_completed_requests_per_second": summary[
+                "completed_requests_per_second"
+            ],
+            "secondary_completed_total_tokens_per_second": summary[
                 "completed_total_tokens_per_second"
             ],
-            "adjacent_throughput_gain": summary["adjacent_throughput_gain"],
+            "completion_vs_engine_percent_difference": (
+                summary["completion_vs_engine"]["completion_vs_engine_percent_difference"]
+                if summary["completion_vs_engine"]["available"]
+                else None
+            ),
+            "max_observed_running": summary["saturation_ceiling_evidence"][
+                "max_observed_running"
+            ],
+            "max_observed_waiting": summary["saturation_ceiling_evidence"][
+                "max_observed_waiting"
+            ],
             "run_valid": summary["run_valid"],
             "invalidation_reasons": summary["invalidation_reasons"],
             "num_preemptions_delta": (
@@ -2172,7 +2670,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-telemetry",
         action="store_true",
-        help="disable vLLM /metrics and GPU telemetry collection (diagnostic only)",
+        help=(
+            "disable vLLM /metrics and GPU telemetry collection. WARNING: "
+            "engine-counter throughput (the primary capacity estimator) "
+            "requires vLLM /metrics telemetry, so every point will be "
+            "invalid ('engine_token_throughput_unavailable:"
+            "telemetry_not_collected') when this is set; use only for "
+            "harness debugging, never for capacity evidence"
+        ),
     )
     return parser
 
@@ -2223,11 +2728,16 @@ def run_cli(config: ExperimentConfig) -> int:
     print(f"artifacts written to: {config.output_dir}")
     print(f"validation status: {bundle['summary']['bucket_validation_status']}")
     for row in bundle["summary"]["review_table"]:
+        engine_tok_s = row["engine_total_tokens_per_second"]
+        secondary_tok_s = row["secondary_completed_total_tokens_per_second"]
         print(
             f"  C={row['concurrency']:>4} "
-            f"req/s={row['completed_requests_per_second']:.4f} "
-            f"tok/s={row['completed_total_tokens_per_second']:.2f} "
+            f"engine_tok/s={engine_tok_s if engine_tok_s is None else f'{engine_tok_s:.2f}'} "
             f"gain={row['adjacent_throughput_gain']} "
+            f"[secondary completion_tok/s={secondary_tok_s:.2f} "
+            f"vs_engine%={row['completion_vs_engine_percent_difference']}] "
+            f"running_max={row['max_observed_running']} "
+            f"waiting_max={row['max_observed_waiting']} "
             f"preemptions_delta={row['num_preemptions_delta']} "
             f"valid={row['run_valid']} "
             f"reasons={row['invalidation_reasons']}"

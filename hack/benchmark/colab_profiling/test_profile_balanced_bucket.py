@@ -137,8 +137,17 @@ class CompatibilityEndToEndTests(unittest.TestCase):
                     return smoke.HttpResponse(200, b'{"version": "0.28.0"}')
                 return smoke.HttpResponse(404, b"")
 
+            metrics_state = {"prompt": 1000.0, "generation": 2000.0}
+
             def metrics_transport(endpoint, timeout):
-                return smoke.HttpResponse(200, b"vllm:num_requests_running 0\n")
+                metrics_state["prompt"] += 50.0
+                metrics_state["generation"] += 30.0
+                body = (
+                    f"vllm:num_requests_running 0\n"
+                    f"vllm:prompt_tokens_total {metrics_state['prompt']}\n"
+                    f"vllm:generation_tokens_total {metrics_state['generation']}\n"
+                ).encode("utf-8")
+                return smoke.HttpResponse(200, body)
 
             def gpu_sampler():
                 return {"available": False, "error": "no gpu in unit tests"}
@@ -159,8 +168,12 @@ class CompatibilityEndToEndTests(unittest.TestCase):
                 concurrency_ladder=(1, 2),
                 timing=profiler.TimingConfig(
                     settling_seconds=0.02,
-                    measurement_seconds=0.05,
-                    drain_timeout_seconds=1.0,
+                    # Generous relative to metrics_interval_seconds so at
+                    # least two telemetry samples reliably land inside
+                    # [T0,T1) even under CI scheduling jitter (the engine
+                    # estimator requires >= 2 valid in-window samples).
+                    measurement_seconds=0.3,
+                    drain_timeout_seconds=2.0,
                     metrics_interval_seconds=0.02,
                     request_timeout_seconds=5.0,
                 ),
@@ -189,6 +202,13 @@ class CompatibilityEndToEndTests(unittest.TestCase):
             ]
             self.assertTrue(all(p["bucket"] == "balanced" for p in point_summaries))
             self.assertTrue(all(p["token_rate_invariant"]["holds"] for p in point_summaries))
+            # The generic primary-estimator contract (engine-counter
+            # throughput) is inherited automatically by the compatibility
+            # wrapper with no wrapper-specific code.
+            self.assertTrue(
+                all(p["engine_token_throughput"]["available"] for p in point_summaries)
+            )
+            self.assertTrue(all(p["run_valid"] for p in point_summaries))
 
 
 if __name__ == "__main__":
