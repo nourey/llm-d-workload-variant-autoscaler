@@ -1,9 +1,181 @@
 # #1546 Colab profiling request data
 
 This directory contains the controlled request-data generator, the bounded
-request-contract smoke client, and the generic fixed-concurrency bucket
-profiling harness for the #1546 single-GPU monolithic-vLLM experiment. It
-does not launch vLLM itself, and it does not implement autoscaling.
+request-contract smoke client, the generic fixed-concurrency bucket
+profiling harness, and the open-loop mixed-workload composition-validation
+harness for the #1546 single-GPU monolithic-vLLM experiment. It does not
+launch vLLM itself, and it does not implement autoscaling.
+
+## Experimental procedure
+
+This section is a single end-to-end map of the whole #1546 experiment. Every
+step below is explained in detail in its own section further down; read this
+first, then jump to the linked section for exact commands/contracts.
+
+```text
+1. generate_dataset.py
+   deterministic synthetic raw TOKEN-ID prompts, per work-shape bucket
+                        |
+                        v
+2. run_request_smoke.py
+   bounded 6-request sanity check of the exact request/response contract
+                        |
+                        v
+3. profile_bucket.py   (repeated once per bucket: input-heavy / balanced / output-heavy)
+   fixed CLOSED-LOOP concurrency ladder
+     -> per-point engine-counter throughput
+       -> human-reviewed saturated maximum  =>  V_M^(bucket)
+                        |
+                        v
+4. (3) is repeated independently for all three work-shape buckets,
+   producing three independent, accepted V_M^(bucket) values
+                        |
+                        v
+5. validate_mixed_workload.py
+   fixed OPEN-LOOP arrival rates for all buckets at once, derived from a
+   target composition rho and the three V_M^(bucket) values from step (4)
+                        |
+                        v
+6. observe waiting / running / outstanding accumulation over [T0, T1)
+                        |
+                        v
+7. compare the predicted rho_pred ~= 1 boundary against where the observed
+   evidence actually shows saturation/backlog onset
+                        |
+                        v
+8. only once this composition gate is accepted does further research into
+   predictors, workload classification, or autoscaling become meaningful
+```
+
+* Steps 1–2: see ["Exactly what is sent to the model"](#exactly-what-is-sent-to-the-model),
+  ["The output contract"](#the-output-contract), and
+  ["Generate in Colab"](#generate-in-colab) /
+  ["Bounded vLLM request-contract smoke"](#bounded-vllm-request-contract-smoke).
+* Steps 3–4: see ["How load is generated"](#how-load-is-generated),
+  ["How `V_M` is measured"](#how-v_m-is-measured), and
+  ["Fixed-concurrency bucket profiling (`profile_bucket.py`)"](#fixed-concurrency-bucket-profiling-profile_bucketpy).
+* Steps 5–8: see ["How load is generated"](#how-load-is-generated) and
+  ["Mixed-workload composition validation"](#mixed-workload-composition-validation).
+
+## Exactly what is sent to the model
+
+**`input-heavy`, `balanced`, and `output-heavy` are WORK-SHAPE classes, not
+semantic classes.** This experiment does not use natural-language prompts as
+experimental truth at all:
+
+* `generate_dataset.py` loads the real Qwen tokenizer's vocabulary and
+  builds, per bucket, deterministic pseudo-random sequences of valid,
+  non-special token IDs of exactly the bucket's `input_tokens` length;
+* those integer token IDs — never any decoded text — are stored directly in
+  `profiling.jsonl` / `heldout.jsonl` as `prompt_token_ids`;
+* every client in this directory (`run_request_smoke.py`, `profile_bucket.py`,
+  `validate_mixed_workload.py`) sends that integer array **directly** as the
+  `/v1/completions` request's `prompt` field; it is never decoded to text and
+  re-tokenized before the request is sent.
+
+Schematically (not a real generated record):
+
+```json
+{
+  "bucket": "input-heavy",
+  "prompt_token_ids": [4913, 210, 88831, "... 384 valid non-special token IDs total ..."],
+  "prompt_token_count": 384,
+  "target_output_tokens": 128,
+  "total_target_tokens": 512
+}
+```
+
+The point of this design is to isolate **input/output length SHAPE** from
+semantic content variability: three buckets that hold total tokens
+(`W = L_in + L_out = 512`) fixed while varying how those 512 tokens split
+between the prompt and the generated output. Whatever text the model
+happens to generate from a synthetic token-ID prompt is not meaningful and
+is never inspected as part of this experiment (see
+["The output contract"](#the-output-contract) below).
+
+## The output contract
+
+Every request forces the engine to execute **exactly `L_out` autoregressive
+decode steps**, never more, never fewer, unless the request itself fails.
+For a bucket record with `target_output_tokens = L_out`, the request payload
+sets:
+
+* `min_tokens = L_out`
+* `max_tokens = L_out`
+* `ignore_eos = true`
+* `temperature = 0`
+* `n = 1`
+* `stream = false`
+* `return_token_ids = true`
+
+(see `request_payload()` in `run_request_smoke.py`, reused unmodified by
+`profile_bucket.py` and `validate_mixed_workload.py`).
+
+A response is only accepted as valid profiling evidence if all of the
+following hold (`validate_response()` in `run_request_smoke.py`):
+
+* `usage.prompt_tokens == L_in`
+* `usage.completion_tokens == L_out`
+* `usage.total_tokens == L_in + L_out`
+* `finish_reason == "length"`
+* the response `model` matches the requested model, and returned
+  `prompt_token_ids`/output token-ID evidence is checked when the server
+  returns it
+
+**The semantic CONTENT of the generated text is irrelevant to this
+experiment.** The controlled, measured quantity is the number of decode
+steps / logical output tokens the engine actually processed — not what those
+tokens mean.
+
+## How load is generated
+
+This directory uses **two deliberately different** load-generation
+strategies for two different questions. Confusing the two invalidates the
+experiment they belong to, so both are described here side by side.
+
+### Pure-bucket profiling: CLOSED LOOP, fixed concurrency (`profile_bucket.py`)
+
+At a target concurrency `C`:
+
+1. the deterministic startup ramp admits the initial `C` requests (paced,
+   not a zero-delay burst — see
+   ["Deterministic initial-admission ramp"](#deterministic-initial-admission-ramp));
+2. once all `C` are outstanding, settling begins, then the `[T0, T1)`
+   measurement window;
+3. throughout settling, measurement, and drain, **the instant one request
+   completes its replacement is admitted immediately**, so client-side
+   offered concurrency stays at approximately `C` the whole time;
+4. `C` is swept across an explicit ladder (e.g. `1,2,4,8,16,32,...`);
+5. engine-counter throughput is measured at each `C`;
+6. a human reviews the resulting throughput-vs-`C` curve to identify the
+   saturated maximum region — see
+   ["How saturation and `V_M` acceptance are determined"](#how-saturation-and-v_m-acceptance-are-determined).
+
+**Concurrency is the independent load variable here.** The generator never
+offers more than `C` outstanding requests at once for that bucket.
+
+### Mixed-workload validation: OPEN LOOP, fixed arrival rate (`validate_mixed_workload.py`)
+
+There is no concurrency cap and no replacement-on-completion here at all:
+
+* completing a request does **not** trigger the next one — each bucket has
+  its own absolute-time arrival schedule fixed in advance:
+  `scheduled_time(k, b) = point_start + phase_b + k / request_rate_b`;
+* arrivals for a bucket keep firing on schedule even while previous
+  requests from that same bucket are still outstanding — this is exactly
+  what lets a genuine server-side backlog (growing `waiting`/`running`/
+  outstanding populations) show up in the evidence instead of being
+  silently absorbed by the client;
+* **request arrival rate is the independent load variable here**, not
+  concurrency;
+* a large, explicit client thread-pool concurrency budget
+  (`--client-concurrency-budget`, default 4096) exists purely so the client
+  itself never becomes the bottleneck; if it is ever actually exhausted,
+  the point is invalidated (`client_concurrency_budget_exceeded`) instead
+  of that client-side queueing being mistaken for server-side saturation.
+
+See ["Mixed-workload composition validation"](#mixed-workload-composition-validation)
+below for the exact scheduling/invalidation contract.
 
 ## Generate in Colab
 
@@ -173,6 +345,82 @@ choice-level `prompt_token_ids` and `token_ids` when vLLM returns them, contract
 failures, and monotonic submit/terminal/latency nanoseconds. These timestamps
 are audit timing only. They are not throughput, saturation, or profiling
 evidence and must not be used to estimate capacity.
+
+## How `V_M` is measured
+
+At a fixed concurrency point, the question being asked is simply:
+
+> How many logical prompt+generation tokens did the vLLM engine actually
+> process per second during the measurement window?
+
+That question is answered from vLLM's own engine-side counters, not from
+counting terminal (finished) requests:
+
+```
+V_hat_M =
+  (
+    delta(vllm:prompt_tokens_total)
+    +
+    delta(vllm:generation_tokens_total)
+  )
+  /
+  delta t
+```
+
+using the first and last valid `/metrics` samples inside `[T0, T1)`. This is
+more robust than terminal-completion accounting because a single request can
+straddle `T0` or `T1`: terminal accounting assigns that request's *entire*
+`L_in + L_out` work to whichever side of the boundary its one finish
+timestamp happens to land on, while the engine counters reflect work as it
+is actually processed, continuously, regardless of when any one request
+finishes. See
+["Primary capacity estimator"](#primary-capacity-estimator-engine-side-token-counter-throughput)
+below for the exact fail-closed contract (missing/ambiguous/reset counters
+always invalidate the point; there is no silent fallback).
+
+`V_M` is **NOT**:
+
+* requests/second,
+* concurrency,
+* physical KV-block-release throughput,
+* isolated decoder `V_D` (no P/D disaggregation is involved here),
+* SLO-safe operating capacity.
+
+`V_M` **is**: the maximum sustainable monolithic logical total-token
+processing rate, for one specific model/GPU/vLLM/serving-config, under one
+specific bucket/work-shape regime.
+
+## How saturation and `V_M` acceptance are determined
+
+A single throughput number at a single concurrency is not `V_M`. Accepting a
+bucket's `V_M` requires running a concurrency ladder and a human reviewing
+the resulting evidence for a maximum/saturated region where:
+
+* increasing offered concurrency no longer materially increases engine
+  throughput;
+* the running-request population approaches an observed engine ceiling
+  (never assumed to be any particular fixed number, e.g. `256`, in
+  general — see
+  ["Primary capacity estimator"](#primary-capacity-estimator-engine-side-token-counter-throughput));
+* additional offered concurrency instead shows up as growing waiting
+  population;
+* failures/preemptions/runtime instability are absent, or present and
+  explicitly reviewed rather than ignored;
+* one or more independent repeats reproduce the candidate saturated region
+  closely enough.
+
+Non-monotonic local dips at individual concurrency points (e.g. the
+`balanced` and `output-heavy` `C=160` dips reproduced twice each — see
+["Supported buckets and validation status"](#supported-buckets-and-validation-status))
+can and do occur; they are not automatically treated as measurement
+failures. **The profiler itself never selects, infers, or auto-accepts a
+plateau.** It only ever produces a per-point evidence table
+(`run_valid`/`invalidation_reasons` plus the raw throughput/telemetry
+numbers); a human reviews that table and records the accepted `V_M` value —
+currently `V_M^(input-heavy) ~= 2.18k`, `V_M^(balanced) ~= 1.97k`, and
+`V_M^(output-heavy) ~= 1.88k` logical token/s (see
+["Supported buckets and validation status"](#supported-buckets-and-validation-status)
+for the full per-point evidence trail behind each value).
 
 ## Fixed-concurrency bucket profiling (`profile_bucket.py`)
 
@@ -637,7 +885,9 @@ The now-removed fields `cluster_tolerance_seconds`, `cluster_count`,
 `--near-concurrency-cluster-threshold-fraction` flags) had misleading
 semantics under the corrected algorithm and have been renamed rather than
 kept for compatibility; no real-hardware artifact depended on the old
-names, since output-heavy has not yet been validated.
+names, since `output-heavy` had not yet been validated at the time of the
+rename (it has since been HUMAN-REVIEWED and ACCEPTED — see
+["Supported buckets and validation status"](#supported-buckets-and-validation-status)).
 
 **This diagnostic is evidence for HUMAN REVIEW only.** It is computed and
 recorded for every point (including a trivial all-zero record for a
@@ -655,11 +905,27 @@ at several concurrency points (roughly -11% to +9%), confirming the
 terminal-completion estimator is genuinely boundary-sensitive for this
 bucket independent of any synchronization artifact. That evidence is why
 engine-side counter throughput is now the PRIMARY estimator (see above) for
-every bucket, not just `output-heavy`. `output-heavy` itself remains under
-human validation: real evidence up to `C=288` is consistent with engine
-throughput approaching its maximum region, but one point (`C=160`) showed
-an unexplained local dip that needs a clean, independent repeat before any
-plateau is reviewed by a human. No output-heavy `V_M` value is accepted.
+every bucket, not just `output-heavy`.
+
+**Chronology to the current accepted `output-heavy` value.** In order: (1)
+the initial completion-based estimator produced a suspicious non-monotonic
+curve, described above; (2) the startup ramp plus the completion-wave
+diagnostic ruled out initial-admission phase synchronization as the cause —
+no near-concurrency completion bursts were found once ramping was enabled;
+(3) engine counters replaced completion throughput as the PRIMARY estimator
+for every bucket, since the remaining discrepancy was explained by
+terminal-completion boundary aliasing, not phase synchronization; (4) the
+`C=160` local dip was independently repeated on real hardware (~1529.9, then
+~1443.3) and treated as reproducible real-runtime scheduler/batching
+behavior rather than a measurement failure; (5) `C=256`/`C=288` saturation
+evidence was subsequently obtained (~1878.2/~1884.0 and ~1839.2 tok/s
+respectively). `output-heavy` was then HUMAN-REVIEWED and ACCEPTED at
+`V_M^(output-heavy) ~= 1.88k` logical token/s — see
+["Supported buckets and validation status"](#supported-buckets-and-validation-status)
+for the complete accepted evidence trail. The lesson from this history
+(terminal-completion accounting is boundary-sensitive for long-output
+buckets; engine counters are not) is why engine-side counter throughput is
+now mandatory for every bucket, not only `output-heavy`.
 
 ### Deterministic initial-admission ramp
 
@@ -734,10 +1000,10 @@ never silently reinterpreted.
   do execute.
 * The closed-loop scheduler uses a bounded Python thread pool (not
   `asyncio`) as the concurrency-limiting mechanism, since this directory's
-  existing components deliberately use only the Python standard library. At
-  higher concurrency values (16, 32) this has not yet been validated against
-  real vLLM latency/jitter; only mocked HTTP transports have been exercised
-  locally.
+  existing components deliberately use only the Python standard library.
+  This has since been exercised on real vLLM/Tesla T4 hardware up through
+  `C=288` (see ["Supported buckets and validation status"](#supported-buckets-and-validation-status));
+  local unit tests still only exercise mocked HTTP transports.
 * A load point's *drain* is bounded by `--drain-timeout-seconds` for
   **invalidation purposes**, but the underlying HTTP call for any
   already-admitted request can still block up to
@@ -748,11 +1014,15 @@ never silently reinterpreted.
   (including settling/drain, not only the measurement window) fails the
   token contract. This is a conservative, documented interpretation of D15;
   it has not been validated against real vLLM warm-up behavior.
-* vLLM 0.28.0's exact `/metrics` surface has not been observed on real
-  hardware by this implementation; parsing is generic Prometheus-text
-  parsing plus a best-effort list of commonly expected `vllm:*` metric
-  names (with a `kv_cache_usage_perc`/`gpu_cache_usage_perc` name fallback),
-  each explicitly marked present/absent.
+* vLLM 0.28.0's `/metrics` surface has since been observed on real
+  hardware, and `vllm:prompt_tokens_total`/`vllm:generation_tokens_total`
+  are the basis for every accepted `V_M` value above. Parsing remains
+  generic Prometheus-text parsing plus a best-effort list of commonly
+  expected `vllm:*` metric names (with a
+  `kv_cache_usage_perc`/`gpu_cache_usage_perc` name fallback), each
+  explicitly marked present/absent, since not every `vllm:*` metric this
+  harness looks for has necessarily been confirmed present on every real
+  run.
 * `--gpu-memory-utilization` and `--prefix-caching` (and `--dtype`,
   `--tensor-parallel-size`, `--max-model-len`, `--generation-config`) are
   **operator-declared** values recorded in the manifest as-is; the profiler
@@ -812,8 +1082,12 @@ never silently reinterpreted.
   advances equal-length sequences in lockstep" from any other server-side
   cause of correlated completions). It is deliberately scoped as
   descriptive evidence, not a root-cause proof.
-* None of this has been exercised against a real network. All local tests
-  use fake/mocked HTTP transports and fake GPU/telemetry samplers.
+* The **automated unit test suite** in this directory never touches a real
+  network: all local tests use fake/mocked HTTP transports and fake
+  GPU/telemetry samplers. Real-network, real-GPU evidence for the accepted
+  `V_M` values above comes only from the Colab/Kaggle runs described in
+  ["Supported buckets and validation status"](#supported-buckets-and-validation-status),
+  not from this test suite.
 
 ### Local tests
 
@@ -849,13 +1123,35 @@ rho_pred = sum_b lambda'_b / V_M^(b)
 lambda'_b = request_rate_b * W_b        (W_b = L_in + L_out for bucket b)
 ```
 
-If `rho_pred` genuinely predicts a mixed workload's saturation boundary,
-then offering a mix of buckets at a combined `rho_pred` materially below 1
-should look stable (no persistent backlog growth), `rho_pred` near 1 should
-show onset/boundary behavior, and `rho_pred` above 1 should show persistent
-accumulation of waiting/outstanding work. **This experiment is the test of
-that hypothesis, not a confirmation of it.** Pure-bucket profiling being
-valid does not itself prove this equation holds.
+Term by term:
+
+* `lambda'_b` — the offered *logical token rate* for bucket `b`: the rate at
+  which that bucket's requests are arriving, multiplied by how many logical
+  tokens (`W_b = L_in + L_out`) each one costs;
+* `V_M^(b)` — the independently profiled, human-accepted sustainable
+  capacity for that same bucket (see
+  ["Supported buckets and validation status"](#supported-buckets-and-validation-status));
+* `lambda'_b / V_M^(b)` — the normalized capacity *demand* that bucket `b`
+  alone would contribute if it had the whole GPU to itself;
+* `rho_pred` — the sum of those per-bucket demands: the total predicted
+  normalized pressure across all buckets sharing the one GPU at once.
+
+Interpretation:
+
+* `rho_pred < 1` — the mix is predicted to sit below capacity;
+* `rho_pred ~= 1` — the predicted saturation boundary;
+* `rho_pred > 1` — the mix is predicted to produce sustained
+  overload/backlog.
+
+**This is an experimental hypothesis to be validated by mixed-load runs, not
+a mathematical guarantee.** If `rho_pred` genuinely predicts a mixed
+workload's saturation boundary, then offering a mix of buckets at a
+combined `rho_pred` materially below 1 should look stable (no persistent
+backlog growth), `rho_pred` near 1 should show onset/boundary behavior, and
+`rho_pred` above 1 should show persistent accumulation of waiting/
+outstanding work. **This experiment is the test of that hypothesis, not a
+confirmation of it.** Pure-bucket profiling being valid does not itself
+prove this equation holds.
 
 ### This is OPEN LOOP, not closed loop
 
@@ -895,12 +1191,16 @@ lambda'_b   = rho_b * V_M(b)
 request_rate_b = lambda'_b / W_b
 ```
 
-The first intended experiment uses **equal normalized capacity
-contribution** (`input-heavy : balanced : output-heavy = 1 : 1 : 1`) at
-target `rho` = **0.70, 1.00, 1.15** (fully overridable via `--target-rho`;
-these are not the only supported values). `V_M(b)` capacities are always an
-explicit `--capacity BUCKET:VALUE` input, recorded verbatim in the
-manifest -- never a hard-coded constant.
+The first experiment used **equal normalized capacity contribution**
+(`input-heavy : balanced : output-heavy = 1 : 1 : 1`) at target `rho` =
+**0.70, 1.00, 1.15** (fully overridable via `--target-rho`; these are not
+the only supported values). Two skewed compositions were subsequently run
+using the same three `V_M(b)` values: an **input-heavy-dominant** mix
+(`alpha = 0.70 / 0.15 / 0.15`) and an **output-heavy-dominant** mix
+(`alpha = 0.15 / 0.15 / 0.70`) — see
+["Composition validation evidence"](#composition-validation-evidence)
+below. `V_M(b)` capacities are always an explicit `--capacity BUCKET:VALUE`
+input, recorded verbatim in the manifest -- never a hard-coded constant.
 
 ### Saturation/backlog evidence is human-reviewed, not auto-decided
 
@@ -955,11 +1255,102 @@ python hack/benchmark/colab_profiling/validate_mixed_workload.py \
   --output-dir /kaggle/working/wva-1546-mixed-equal-weight
 ```
 
-### Next step if this first mix behaves consistently with prediction
+### Composition validation evidence
 
-If the equal-weight mix's recorded evidence is consistent with the
-`rho_pred` hypothesis, the next experiment should use **skewed, held-out
-mixes** (e.g. an input-heavy-dominant mix and an output-heavy-dominant mix)
-to test whether the equal-weight result was accidental. Predictor design
-and autoscaling controller logic both remain explicitly deferred beyond
-this validation gate.
+Three compositions have been run so far, all using the same three
+independently profiled `V_M(b)` values (`V_M^(input-heavy) ~= 2.18k`,
+`V_M^(balanced) ~= 1.97k`, `V_M^(output-heavy) ~= 1.88k` logical token/s):
+
+| Composition (`alpha` input/balanced/output) | Predicted `rho=1` capacity | Observed boundary/saturated capacity | Approx. error |
+| --- | ---: | ---: | ---: |
+| Equal (`1/3, 1/3, 1/3`) | ~= 2008 tok/s | ~= 1996–2075 tok/s | within a few percent |
+| Input-heavy dominant (`0.70, 0.15, 0.15`) | ~= 2103 tok/s | ~= 2093–2107 tok/s | nearly exact |
+| Output-heavy dominant (`0.15, 0.15, 0.70`) | ~= 1938 tok/s | ~= 1868 tok/s | over-predicted by ~= 3.6% |
+
+Across these three tested compositions, observed error is roughly within
+±4%. **Do not overstate this beyond the exact tested configuration**: this
+is evidence from three specific composition ratios, on one fixed Qwen2.5-3B
+/ Tesla T4 / vLLM 0.28 monolithic serving configuration, using the three
+fixed `L_in`/`L_out` buckets defined above. Stated precisely:
+
+> Within this fixed Qwen2.5-3B / Tesla T4 / vLLM 0.28 monolithic
+> configuration and the three tested work-shape buckets, the independently
+> measured `V_M` values produced mixed-workload saturation predictions
+> within roughly a few percent, across the three composition ratios tested
+> so far.
+
+### "Held-out" means held-out composition, not (yet) a held-out prompt split
+
+This is an important distinction for anyone reading the evidence above.
+Every mixed-workload run so far, including all three compositions in the
+table above, was invoked with `--profiling-jsonl .../profiling.jsonl` --
+the **same prompt pool** already used by the pure-bucket profiling runs
+that produced the `V_M(b)` values being tested. So:
+
+* "held-out" in the results above refers to **held-out workload
+  composition** -- the equal, input-heavy-dominant, and output-heavy-
+  dominant *mixture ratios* were not used to derive `V_M(b)` and are a
+  genuine out-of-sample test of the composition equation;
+* it does **not** mean a held-out **prompt split**. `heldout.jsonl` (see
+  ["Artifacts and contract"](#artifacts-and-contract)) exists specifically
+  as a separate prompt pool for exactly this purpose, but it has **not**
+  been used to produce any of the mixed-GPU evidence reported here;
+* a natural robustness follow-up -- not yet performed, and not claimed
+  above -- is to repeat one or more of these mixed compositions using
+  `--profiling-jsonl .../heldout.jsonl` instead, to rule out reuse of the
+  same prompt pool as a confound. This is a suggested next step, not a
+  result.
+
+### Experiment scope: what this does and does not establish
+
+This experiment, as run so far, **does** support:
+
+* bucket-specific work-shape capacity is measurable and repeatable under
+  this fixed serving configuration;
+* independently measured bucket capacities approximately compose (within
+  roughly a few percent) for the three tested workload mixtures;
+* input/output token shape matters even when total `W` is held fixed at
+  512 -- `V_M` differs meaningfully across the three buckets despite equal
+  `W`.
+
+This experiment, as run so far, **does not** establish:
+
+* natural-language / semantic workload generalization;
+* arbitrary prompt distributions;
+* arbitrary `L_in`/`L_out` bucket definitions beyond the three tested;
+* unequal-`W_b` mixed composition validity on real hardware -- the harness
+  supports different `W_b` per bucket mathematically (see the `rho_pred`
+  formula above), but **all three currently validated buckets have
+  `W = 512`**, and mixed composition with genuinely different `W_b` values
+  has not yet been validated on real hardware;
+* another model, another GPU, or another vLLM configuration;
+* P/D disaggregated decoder `V_D`;
+* SLO-safe serving capacity;
+* production autoscaling correctness.
+
+### Synthetic work-shape isolation vs. real workload prediction
+
+This phase intentionally isolates **length shape** from semantic content.
+The model producing arbitrary, semantically meaningless text from synthetic
+token-ID prompts is acceptable *because output semantics are not the
+variable under study here* -- see
+["Exactly what is sent to the model"](#exactly-what-is-sent-to-the-model).
+
+However, before any of this can support a claim that a production
+autoscaler can classify or predict *real* incoming workloads, later
+research must connect real prompts and/or real runtime signals to these
+work-shape regimes. That connection -- predictor design, predictor-less
+approaches, hidden-state-based approaches, or any other classification
+mechanism -- is explicitly out of scope here; this document only states the
+boundary, it does not cross it.
+
+### Next step
+
+The input-heavy-dominant and output-heavy-dominant compositions above were
+run specifically to test whether the equal-weight result was accidental,
+and the composition equation held reasonably well (within roughly ±4%)
+across all three. The most useful next step is the `heldout.jsonl` repeat
+described above, to rule out prompt-pool reuse as a confound, before
+treating this composition evidence as more broadly reliable. Predictor
+design and autoscaling controller logic both remain explicitly deferred
+beyond this validation gate.
