@@ -2250,10 +2250,8 @@ class ManifestTests(unittest.TestCase):
         self.assertIn("Declared by the operator", note)
 
     def test_manifest_records_selected_bucket_and_validation_status(self) -> None:
-        # output-heavy remains under human validation (the suspected
-        # phase-synchronization artifact was ruled out after ramping, but
-        # the engine-vs-completion evidence and one anomalous point still
-        # require human review); balanced and input-heavy are validated.
+        # All three buckets are now HUMAN-REVIEWED and ACCEPTED using the
+        # primary engine-counter estimator (#1546).
         config = self._build_config(bucket="output-heavy", run_id="r1")
         manifest = profiler.build_manifest(
             config,
@@ -2264,23 +2262,31 @@ class ManifestTests(unittest.TestCase):
         )
         self.assertEqual(manifest["dataset"]["bucket_definition"]["name"], "output-heavy")
         self.assertIn(
-            "UNDER HUMAN VALIDATION", manifest["bucket_validation_status"]
+            "VALIDATED and ACCEPTED", manifest["bucket_validation_status"]
         )
+        self.assertIn("V_M^(output-heavy) ~= 1.88k", manifest["bucket_validation_status"])
         self.assertIn("primary_capacity_estimator", manifest)
         self.assertTrue(manifest["primary_capacity_estimator"]["mandatory"])
 
-    def test_input_heavy_and_balanced_are_validated(self) -> None:
-        self.assertIn("VALIDATED", profiler.BUCKET_VALIDATION_STATUS["balanced"])
-        self.assertNotIn(
-            "UNDER HUMAN VALIDATION", profiler.BUCKET_VALIDATION_STATUS["balanced"]
-        )
-        self.assertIn("VALIDATED", profiler.BUCKET_VALIDATION_STATUS["input-heavy"])
-        self.assertNotIn(
-            "UNDER HUMAN VALIDATION", profiler.BUCKET_VALIDATION_STATUS["input-heavy"]
+    def test_all_three_buckets_are_validated_and_accepted(self) -> None:
+        self.assertIn("VALIDATED and ACCEPTED", profiler.BUCKET_VALIDATION_STATUS["balanced"])
+        self.assertIn("V_M^(balanced) ~= 1.97k", profiler.BUCKET_VALIDATION_STATUS["balanced"])
+        self.assertIn(
+            "VALIDATED and ACCEPTED", profiler.BUCKET_VALIDATION_STATUS["input-heavy"]
         )
         self.assertIn(
-            "UNDER HUMAN VALIDATION", profiler.BUCKET_VALIDATION_STATUS["output-heavy"]
+            "V_M^(input-heavy) ~= 2.18k", profiler.BUCKET_VALIDATION_STATUS["input-heavy"]
         )
+        self.assertIn(
+            "VALIDATED and ACCEPTED", profiler.BUCKET_VALIDATION_STATUS["output-heavy"]
+        )
+        self.assertIn(
+            "V_M^(output-heavy) ~= 1.88k", profiler.BUCKET_VALIDATION_STATUS["output-heavy"]
+        )
+        # Acceptance text explicitly distinguishes itself from automatic
+        # inference/run validity.
+        for status in profiler.BUCKET_VALIDATION_STATUS.values():
+            self.assertIn("HUMAN-REVIEWED", status)
 
     def test_config_validation_rejects_bad_gpu_memory_utilization(self) -> None:
         config = self._build_config(gpu_memory_utilization=1.5)

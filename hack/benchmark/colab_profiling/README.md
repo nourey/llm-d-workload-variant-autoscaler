@@ -187,57 +187,43 @@ per run:
 
 ### Supported buckets and validation status
 
-| Bucket | `L_in` | `L_out` | `W` (total target tokens) | Real-hardware status |
+All three buckets are now HUMAN-REVIEWED and ACCEPTED, using the PRIMARY
+engine-counter estimator (see
+["Primary capacity estimator"](#primary-capacity-estimator-engine-side-token-counter-throughput)
+below) — NOT the secondary, boundary-sensitive terminal-completion
+estimator that an earlier iteration of this evidence mistakenly relied on.
+
+| Bucket | `L_in` | `L_out` | `W` (total target tokens) | Accepted `V_M` (engine-counter, HUMAN-REVIEWED) |
 | --- | ---: | ---: | ---: | --- |
-| `balanced` | 256 | 256 | 512 | **VALIDATED** on real Tesla T4 hardware (see below) |
-| `input-heavy` | 384 | 128 | 512 | **VALIDATED** on independent real Tesla T4 hardware |
-| `output-heavy` | 128 | 384 | 512 | **UNDER HUMAN VALIDATION** (see below) |
+| `input-heavy` | 384 | 128 | 512 | **≈ 2.18k logical token/s** |
+| `balanced` | 256 | 256 | 512 | **≈ 1.97k logical token/s** |
+| `output-heavy` | 128 | 384 | 512 | **≈ 1.88k logical token/s** |
 
-**Balanced-bucket result (already validated, do not re-derive from local
-tests):** two independent 180s confirmation runs, on independent Tesla T4
-instances, under the identical serving configuration documented below,
-reproduced:
+Each bucket independently reproduced a local, non-monotonic dip at one
+mid-ladder concurrency point on two independent runs (e.g. `output-heavy`
+`C=160` ≈ 1529.9 then repeat ≈ 1443.3; `balanced` `C=160` ≈ 1623.2 then
+repeat ≈ 1624.7). This is treated as reproducible real-runtime scheduler/
+batching behavior, **not a measurement failure**, and does not invalidate
+the observed maximum/saturated region used for the accepted value. Full
+per-bucket engine-throughput evidence (every concurrency point, both
+repeats, the `C=288` saturation probes) is recorded in
+`profiler.BUCKET_VALIDATION_STATUS` in `profile_bucket.py`.
 
-```
-C=48: 1228.8 logical token/s
-C=64: 1274.3 logical token/s   (adjacent gain ~3.7%)
-```
+**Bucket capacity ACCEPTANCE (the table above) is a distinct HUMAN REVIEW
+decision from per-point RUN VALIDITY** (`run_valid`/`invalidation_reasons`,
+computed by this module for every point). This module never infers, auto-
+selects, or auto-accepts a capacity value — it only ever fails a point
+closed or reports raw evidence for a human to review.
 
-giving a provisional empirical monolithic capacity
-`V_M^(balanced) ≈ 1274 logical token/s`.
-
-**Input-heavy result (already validated, do not re-derive from local
-tests):** validated on independent real Tesla T4 hardware runs under the
-same monolithic non-P/D serving configuration, giving a provisional
-empirical monolithic capacity `V_M^(input-heavy) ≈ 1820 logical token/s`.
-
-Both conclusions were reached by HUMAN REVIEW of real Colab evidence, not by
-this repository's code.
-
-**Output-heavy is UNDER HUMAN VALIDATION (not yet accepted).** A
-deterministic startup ramp was added and ramped real-runtime re-profiling
-WAS performed on real Tesla T4 hardware: the non-chaining completion-burst
-diagnostic found NO near-concurrency completion-wave synchronization after
-ramping, ruling out startup phase-synchronization as the main explanation
-for the originally observed anomaly. The terminal-completion estimator
-nonetheless remained materially boundary-sensitive for this long-output
-bucket, which is why engine-side vLLM counter throughput is now the
-PRIMARY capacity estimator for every bucket — see
-["Primary capacity estimator: engine-side token-counter throughput"](#primary-capacity-estimator-engine-side-token-counter-throughput)
-and
-["Output-heavy completion-wave risk"](#output-heavy-completion-wave-risk-estimator-quality-vs-measurement-validity)
-below. Real evidence up to `C=288` suggests output-heavy engine throughput
-is approaching its maximum region, but one concurrency point (`C=160`)
-showed an unexplained local dip requiring a clean repeat, and **no
-output-heavy `V_M` value is accepted**. Do not treat any output-heavy
-number as validated until that repeat and a human plateau review are
-complete.
-
-Every run profiles **exactly one** bucket, using **only**
-`profiling.jsonl` records for that bucket (never `heldout.jsonl` and never
-another bucket's records). This tool does not run held-out mixtures, does
-not implement mixed-workload composition, and does not implement
-autoscaling.
+Every run of `profile_bucket.py` profiles **exactly one** bucket, using
+**only** `profiling.jsonl` records for that bucket (never `heldout.jsonl`
+and never another bucket's records). This tool does not run held-out
+mixtures and does not implement autoscaling. The next research gate --
+whether these independently measured `V_M^(b)` values predict a MIXED
+workload's saturation boundary -- is implemented separately in
+`validate_mixed_workload.py`; see
+["Mixed-workload composition validation"](#mixed-workload-composition-validation)
+below.
 
 **This tool is non-P/D monolithic `V_M` evidence.** It reports a
 *total-token* (prompt + completion) service rate under one fixed serving
@@ -805,15 +791,17 @@ never silently reinterpreted.
   MANDATORY for a valid point (see "Primary capacity estimator" above); a
   point without it is invalidated rather than silently falling back to
   completion throughput.
-* `output-heavy` remains **UNDER HUMAN VALIDATION, not yet accepted**.
-  Real evidence up to `C=288` suggests engine throughput is approaching its
-  maximum region (a persistent running-request ceiling and growing waiting
-  population appear at high offered concurrency — see
-  `saturation_ceiling_evidence`), but one concurrency point (`C=160`)
-  showed an unexplained local engine-throughput dip that requires a clean
-  repeat before any human plateau review. `balanced` and `input-heavy` are
-  both validated; `output-heavy` is not, and no output-heavy `V_M` value is
-  accepted by this repository.
+* **Resolved (all three buckets now VALIDATED and ACCEPTED):**
+  `output-heavy`'s C=160 local dip (~1529.9, independently repeated at
+  ~1443.3) and `balanced`'s C=160 local dip (~1623.2, repeat ~1624.7) were
+  both independently reproduced on two runs each, and are treated as
+  reproducible real-runtime scheduler/batching behavior -- not a
+  measurement failure -- since they do not affect the observed maximum/
+  saturated region. `V_M^(input-heavy) ~= 2.18k`, `V_M^(balanced) ~= 1.97k`,
+  and `V_M^(output-heavy) ~= 1.88k` logical token/s are all HUMAN-REVIEWED,
+  ACCEPTED engine-counter values; see `BUCKET_VALIDATION_STATUS` in
+  `profile_bucket.py` for the complete per-point evidence trail. This
+  module still never infers or auto-accepts any capacity value itself.
 * The `0.05s` default ramp interval, and the `0.5s` default burst window /
   `0.8` default near-concurrency threshold, remain reasoned defaults
   (documented above); they were not altered by adopting the engine-counter
@@ -841,3 +829,137 @@ buckets (selection, dynamic request/invariant arithmetic, concurrency/window/
 drain semantics, telemetry summaries, and manifest fields).
 `test_profile_balanced_bucket.py` covers only the thin compatibility
 wrapper (no `--bucket` flag, always `balanced`, same artifact shape).
+`test_validate_mixed_workload.py` covers the open-loop mixed-workload
+harness described below (composition math, deterministic scheduling,
+fail-closed client/scheduling-lag/drain-chaining behavior, and artifact
+writing).
+
+## Mixed-workload composition validation
+
+Pure single-bucket profiling above establishes that each bucket's
+monolithic `V_M^(b)` is independently *repeatable*. It does **not** prove
+those numbers are *useful*: it says nothing about whether they predict
+anything once buckets are mixed together. That is the next, decisive
+research gate, implemented in `validate_mixed_workload.py`.
+
+### The hypothesis under test
+
+```
+rho_pred = sum_b lambda'_b / V_M^(b)
+lambda'_b = request_rate_b * W_b        (W_b = L_in + L_out for bucket b)
+```
+
+If `rho_pred` genuinely predicts a mixed workload's saturation boundary,
+then offering a mix of buckets at a combined `rho_pred` materially below 1
+should look stable (no persistent backlog growth), `rho_pred` near 1 should
+show onset/boundary behavior, and `rho_pred` above 1 should show persistent
+accumulation of waiting/outstanding work. **This experiment is the test of
+that hypothesis, not a confirmation of it.** Pure-bucket profiling being
+valid does not itself prove this equation holds.
+
+### This is OPEN LOOP, not closed loop
+
+Unlike `profile_bucket.py`'s fixed-concurrency closed loop, the independent
+variable here is **arrival rate**, not a concurrency cap:
+
+* each participating bucket gets its own deterministic, absolute-time
+  arrival schedule: `scheduled_time(k) = point_start + phase_b + k /
+  request_rate_b`, computed directly from `(origin, phase, rate, k)` --
+  **never** as `previous_actual_time + interval`, which would let runtime
+  delay silently shrink the achieved rate;
+* a bucket's next arrival is scheduled purely from its own plan and never
+  waits for its previous arrival to complete, so the generator keeps
+  offering load while requests are still outstanding -- exactly what is
+  needed to observe genuine server-side backlog;
+* the HTTP client's concurrency budget (thread-pool size) is an explicit,
+  generous, recorded value (`--client-concurrency-budget`, default 4096)
+  deliberately set far above any expected server-side backlog, so client
+  thread-pool queueing can never masquerade as vLLM's own queueing; if the
+  budget is ever actually reached, the point is invalidated
+  (`client_concurrency_budget_exceeded`) rather than silently reinterpreted
+  as server saturation.
+
+Target arrival rate and achieved (actually observed) arrival rate are both
+recorded per bucket per point (`rho_pred_target` and `rho_pred_achieved`),
+using the SAME `rho_pred` formula, so they are directly comparable.
+
+### Composition weights
+
+Weights (`alpha_b`, normalized to sum to 1) describe each bucket's
+*intended contribution to `rho_pred`* -- **not** equal request counts and
+**not** equal raw token rates:
+
+```
+rho_b       = target_rho * alpha_b
+lambda'_b   = rho_b * V_M(b)
+request_rate_b = lambda'_b / W_b
+```
+
+The first intended experiment uses **equal normalized capacity
+contribution** (`input-heavy : balanced : output-heavy = 1 : 1 : 1`) at
+target `rho` = **0.70, 1.00, 1.15** (fully overridable via `--target-rho`;
+these are not the only supported values). `V_M(b)` capacities are always an
+explicit `--capacity BUCKET:VALUE` input, recorded verbatim in the
+manifest -- never a hard-coded constant.
+
+### Saturation/backlog evidence is human-reviewed, not auto-decided
+
+Every point records, in addition to the mandatory `engine_token_throughput`
+estimator (the identical, unmodified contract from `profile_bucket.py`):
+waiting-population mean/min/max/first-and-last-window medians/linear
+trend, running-population mean/max/observed-ceiling fraction (never a
+hard-coded 256), client outstanding-request counts at `T0`/`T1`, and
+request/failure/drain evidence. The harness does **not** contain logic like
+`if rho < 1 and waiting == 0: model_valid = true`; it produces a compact
+human review table (`target_rho`, `achieved_rho`, request/engine rates,
+waiting/running/outstanding evidence, `run_valid`) and stops there.
+Expected overload/backlog under `rho >= 1` is NOT itself a run-invalid
+condition -- only a harness/precondition/client-generator failure
+(unreachable server, unsustainable client schedule, a prior point that
+failed to drain) is.
+
+### Point lifecycle
+
+Precondition check → (fail closed if the *previous* point did not fully
+drain) → start all bucket arrival streams → settling → `T0` → same arrival
+streams continue → `T1` → stop new arrivals → bounded drain → atomic
+artifact write. The server is never reset between points; every point
+simply requires the previous one to have drained successfully first.
+
+### First experiment: Kaggle command
+
+```bash
+python hack/benchmark/colab_profiling/validate_mixed_workload.py \
+  --profiling-jsonl /kaggle/working/wva-1546-prompts/profiling.jsonl \
+  --base-url http://127.0.0.1:8000 \
+  --model Qwen/Qwen2.5-3B \
+  --tokenizer-revision 3aab1f1954e9cc14eb9509a215f9e5ca08227a9b \
+  --vllm-version 0.28.0 \
+  --dtype float16 \
+  --tensor-parallel-size 1 \
+  --max-model-len 1024 \
+  --generation-config vllm \
+  --gpu-memory-utilization 0.90 \
+  --capacity input-heavy:2180 \
+  --capacity balanced:1965 \
+  --capacity output-heavy:1880 \
+  --weight input-heavy:1 \
+  --weight balanced:1 \
+  --weight output-heavy:1 \
+  --target-rho 0.70 --target-rho 1.00 --target-rho 1.15 \
+  --settling-seconds 60 \
+  --measurement-seconds 180 \
+  --metrics-interval-seconds 1 \
+  --drain-timeout-seconds 300 \
+  --request-timeout-seconds 600 \
+  --output-dir /kaggle/working/wva-1546-mixed-equal-weight
+```
+
+### Next step if this first mix behaves consistently with prediction
+
+If the equal-weight mix's recorded evidence is consistent with the
+`rho_pred` hypothesis, the next experiment should use **skewed, held-out
+mixes** (e.g. an input-heavy-dominant mix and an output-heavy-dominant mix)
+to test whether the equal-weight result was accidental. Predictor design
+and autoscaling controller logic both remain explicitly deferred beyond
+this validation gate.

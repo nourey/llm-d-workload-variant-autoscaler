@@ -23,25 +23,35 @@ vLLM's own ``vllm:prompt_tokens_total``/``vllm:generation_tokens_total``
 counter deltas), not terminal-completion accounting -- see
 ``summarize_engine_token_throughput`` and D1/D2 below.
 
-As of this implementation:
+All three buckets have now been HUMAN-REVIEWED and ACCEPTED using the
+PRIMARY engine-counter estimator (not the secondary completion-based
+estimator, which is retained only as a diagnostic):
 
-* the ``balanced`` bucket has been VALIDATED on real Tesla T4 hardware
-  (two independent 180s confirmation runs; see the #1546 evidence record):
-  ``V_M^(balanced) ~= 1274 logical token/s``;
-* the ``input-heavy`` bucket has also been VALIDATED on independent real
-  Tesla T4 runs: ``V_M^(input-heavy) ~= 1820 logical token/s``;
-* the ``output-heavy`` bucket is UNDER HUMAN VALIDATION (not yet accepted).
-  Ramped real-runtime re-profiling WAS performed; the non-chaining
-  completion-burst diagnostic found NO near-concurrency completion-wave
-  synchronization after ramping, ruling out startup phase-synchronization
-  as the main explanation. The terminal-completion estimator nonetheless
-  remained materially boundary-sensitive for this long-output bucket
-  (roughly -11% to +9% vs. engine counters), which is why engine-counter
-  throughput is now the PRIMARY estimator for every bucket. Real evidence
-  up to C=288 suggests output-heavy throughput is approaching its maximum
-  region, but one point (C=160) showed an unexplained local dip requiring
-  a clean repeat; see ``BUCKET_VALIDATION_STATUS["output-heavy"]`` for the
-  full evidence summary. No output-heavy V_M value is accepted.
+* ``V_M^(input-heavy) ~= 2.18k logical token/s``;
+* ``V_M^(balanced) ~= 1.97k logical token/s``;
+* ``V_M^(output-heavy) ~= 1.88k logical token/s``.
+
+Each bucket independently reproduced a local, non-monotonic dip at one
+mid-ladder concurrency point (e.g. output-heavy C=160, balanced C=160) on
+two independent runs; this is treated as reproducible real-runtime
+scheduler/batching behavior, not a measurement failure, and does not
+invalidate the observed maximum/saturated region used for the accepted
+value. See ``BUCKET_VALIDATION_STATUS`` for the full per-bucket evidence
+summary. These are still monolithic non-P/D ``V_M`` values: NOT physical
+KV-release throughput, NOT isolated decoder ``V_D``, and NOT SLO-safe
+operating capacity.
+
+Bucket capacity ACCEPTANCE (the numeric values above) is a distinct
+HUMAN REVIEW decision from per-point RUN VALIDITY (``run_valid``/
+``invalidation_reasons``, computed by this module). This module never
+infers or auto-accepts a capacity value; it only ever fails a point closed
+or reports raw evidence.
+
+The next research gate for #1546 is a held-out MIXED-workload composition
+validation (whether these independently measured ``V_M^(b)`` values predict
+a mixed-workload saturation boundary); see ``validate_mixed_workload.py``.
+This module remains the pure single-bucket profiler and is unchanged by
+that new harness.
 
 It intentionally reuses the already-accepted dataset and request-contract
 layers instead of duplicating them:
@@ -145,42 +155,51 @@ BUCKETS_BY_NAME: dict[str, generator.Bucket] = {
 # on a real GPU as of this implementation (see #1546 evidence). This is
 # purely a documentation/traceability aid; it never gates execution.
 BUCKET_VALIDATION_STATUS: dict[str, str] = {
-    "balanced": (
-        "VALIDATED on real Tesla T4 hardware: two independent 180s "
-        "confirmation runs reproduced C=48 -> ~1228.8 tok/s and "
-        "C=64 -> ~1274.3 tok/s (adjacent gain ~3.7%). "
-        "V_M^(balanced) ~= 1274 logical token/s."
-    ),
     "input-heavy": (
-        "VALIDATED on independent real Tesla T4 hardware runs under the "
-        "same monolithic non-P/D serving configuration. "
-        "V_M^(input-heavy) ~= 1820 logical token/s."
+        "VALIDATED and ACCEPTED using the PRIMARY engine-counter "
+        "estimator on real Tesla T4 hardware: engine total-token "
+        "throughput C=64 -> ~1714.8, C=128 -> ~2107.2, C=192 -> ~2179.8, "
+        "C=256 -> ~2160.1 (independent repeat ~2181.0), and a C=288 "
+        "saturation probe -> ~2167.2 tok/s (running max=256, waiting "
+        "max=40, zero preemptions, valid run). "
+        "V_M^(input-heavy) ~= 2.18k logical token/s (HUMAN-REVIEWED "
+        "acceptance; this module never infers or auto-accepts this "
+        "value)."
+    ),
+    "balanced": (
+        "VALIDATED and ACCEPTED using the PRIMARY engine-counter "
+        "estimator on real Tesla T4 hardware: engine total-token "
+        "throughput C=64 -> ~1302.9 (repeat ~1305.1), C=80 -> ~1434.6, "
+        "C=96 -> ~1575.1 (repeat ~1574.3), C=128 -> ~1739.0, "
+        "C=160 -> ~1623.2 (repeat ~1624.7; a reproducible local dip, not "
+        "a measurement failure), C=192 -> ~1789.4, C=224 -> ~1790.5, "
+        "C=256 -> ~1967.7 (independent repeat ~1965.1), and a C=288 "
+        "saturation probe -> ~1950.4 tok/s (running max=256, waiting "
+        "max=36, zero preemptions, valid run). "
+        "V_M^(balanced) ~= 1.97k logical token/s (HUMAN-REVIEWED "
+        "acceptance; this module never infers or auto-accepts this "
+        "value)."
     ),
     "output-heavy": (
-        "UNDER HUMAN VALIDATION (not yet accepted). A deterministic "
-        "startup ramp was added and ramped real-runtime re-profiling WAS "
-        "performed on real Tesla T4 hardware. The non-chaining fixed-"
-        "width completion-burst diagnostic found NO near-concurrency "
-        "completion-wave synchronization after ramping was enabled, "
-        "ruling out initial-admission phase synchronization as the main "
-        "explanation. However, the terminal-completion throughput "
-        "estimator (completed_total_tokens_per_second) remained "
-        "materially boundary-sensitive for this long-output bucket "
-        "(differences of roughly -11% to +9% against engine-side vLLM "
-        "counters across concurrency points). Engine-side counter "
-        "throughput (engine_token_throughput.total_tokens_per_second, "
-        "derived from vllm:prompt_tokens_total + "
-        "vllm:generation_tokens_total deltas) is now the PRIMARY capacity "
-        "estimator for every bucket, precisely because of this evidence. "
-        "Real-runtime evidence up to C=288 suggests output-heavy engine "
-        "throughput is approaching its maximum region (a persistent "
-        "running-request ceiling and growing waiting population appear "
-        "at high offered concurrency), but one concurrency point (C=160) "
-        "showed an unexplained local engine-throughput dip that requires "
-        "a clean repeat, and NO final V_M(output-heavy) value is "
-        "accepted. Do not treat any output-heavy capacity number as "
-        "validated until that repeat and a human plateau review are "
-        "complete."
+        "VALIDATED and ACCEPTED using the PRIMARY engine-counter "
+        "estimator on real Tesla T4 hardware. A deterministic startup "
+        "ramp was added and ramped real-runtime re-profiling WAS "
+        "performed; the non-chaining fixed-width completion-burst "
+        "diagnostic found NO near-concurrency completion-wave "
+        "synchronization after ramping, ruling out initial-admission "
+        "phase synchronization as the primary explanation for the "
+        "originally observed anomaly. Engine total-token throughput: "
+        "C=192 -> ~1666.5 (independent repeat ~1666.8), C=224 -> "
+        "~1726.4, C=256 -> ~1878.2 (independent repeat ~1884.0), and a "
+        "C=288 saturation probe -> ~1839.2 tok/s (running max=256, "
+        "waiting max=32, zero failures, zero preemptions). A local "
+        "non-monotonic dip at C=160 was independently reproduced "
+        "(~1529.9, repeat ~1443.3); this is treated as reproducible "
+        "real-runtime scheduler/batching behavior, not a measurement "
+        "failure, and does not invalidate the observed maximum/saturated "
+        "region. V_M^(output-heavy) ~= 1.88k logical token/s "
+        "(HUMAN-REVIEWED acceptance; this module never infers or "
+        "auto-accepts this value)."
     ),
 }
 
